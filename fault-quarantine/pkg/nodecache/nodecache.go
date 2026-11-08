@@ -37,6 +37,7 @@ import (
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/ext"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	toolscache "k8s.io/client-go/tools/cache"
 
 	"github.com/nvidia/nvsentinel/commons/pkg/celfields"
@@ -166,6 +167,19 @@ func (k *Keys) addOperational(cfg config.TomlConfig, operational Operational) {
 	}
 
 	k.labels[statemanager.NVSentinelStateLabelKey] = struct{}{}
+
+	if cfg.GPUHealthRecheck.Enabled {
+		selector, err := labels.Parse(cfg.GPUHealthRecheck.NodeSelector)
+		if err != nil {
+			// Requester initialization reports the invalid selector.
+			k.pruneLabels = false
+		} else {
+			requirements, _ := selector.Requirements()
+			for _, requirement := range requirements {
+				k.labels[requirement.Key()] = struct{}{}
+			}
+		}
+	}
 
 	if operational.GPUNodeLabelKey != "" {
 		k.labels[operational.GPUNodeLabelKey] = struct{}{}
