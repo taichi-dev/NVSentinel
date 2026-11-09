@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/nvidia/nvsentinel/commons/pkg/statemanager"
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
@@ -44,7 +45,7 @@ import (
 
 const (
 	gpuRecheckAnnotation = "nvsentinel.nvidia.com/gpu-health-recheck"
-	gpuRecheckRequestKey = "gpuRecheckRequest"
+	gpuRecheckRequestKey = common.GPURecheckRequestKey
 	gpuRecheckNodeKey    = "gpuRecheckNodeUID"
 	gpuRecheckECC        = "DCGM_FR_VOLATILE_DBE_DETECTED"
 )
@@ -88,10 +89,36 @@ func newGPURechecker(client *informer.FaultQuarantineClient, cfg config.GPUHealt
 		return nil, fmt.Errorf("invalid GPU recheck pod selector: %q", cfg.PodSelector)
 	}
 
-	return &gpuRechecker{
+	c := &gpuRechecker{
 		client: client, config: cfg, selector: selector,
 		enrolled: make(map[string]*gpuRecheckEnrollment),
-	}, nil
+	}
+
+	_, err = client.NodeInformer.GetInformer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		UpdateFunc: c.observeEnrollmentExit,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("watch GPU recheck enrollment exits: %w", err)
+	}
+
+	return c, nil
+}
+
+// Observe exits even when a node rejoins between periodic scans.
+func (c *gpuRechecker) observeEnrollmentExit(oldObj, newObj any) {
+	oldNode, oldOK := oldObj.(*corev1.Node)
+	node, ok := newObj.(*corev1.Node)
+
+	if !oldOK || !ok || !c.selector.Matches(labels.Set(oldNode.Labels)) || c.selector.Matches(labels.Set(node.Labels)) {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if entry := c.enrolled[oldNode.Name]; entry != nil && entry.request.NodeUID == string(oldNode.UID) {
+		delete(c.enrolled, oldNode.Name)
+	}
 }
 
 func (c *gpuRechecker) run(ctx context.Context) {
@@ -109,13 +136,13 @@ func (c *gpuRechecker) run(ctx context.Context) {
 // a monitor make API calls; completing repair does not rearm an enrollment.
 // This opt-in requester supports one FQ replica.
 func (c *gpuRechecker) reconcile(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	nodes, err := c.client.NodeInformer.Lister().List(c.selector)
 	if err != nil {
 		return fmt.Errorf("list cached recheck nodes: %w", err)
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	present := make(map[string]bool, len(nodes))
 

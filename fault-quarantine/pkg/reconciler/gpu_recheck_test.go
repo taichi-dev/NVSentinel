@@ -24,6 +24,7 @@ import (
 	"github.com/nvidia/nvsentinel/commons/pkg/statemanager"
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
 	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/coldstart"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/config"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/informer"
@@ -32,8 +33,12 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func recheckFixture(t *testing.T) (context.Context, *gpuRechecker, *corev1.Node, *corev1.Pod) {
@@ -182,13 +187,36 @@ func TestGPURecheckEnrollmentChanges(t *testing.T) {
 	original := node.Labels["repair-test"]
 	delete(node.Labels, "repair-test")
 	node = updateRecheckNode(t, ctx, c, node)
-	require.NoError(t, c.reconcile(ctx))
+	// Both label changes can occur between the requester's periodic scans.
+	require.ErrorIs(t, validateRecheck(ctx, c, first), errStaleGPURecheck)
 	node.Labels = map[string]string{"repair-test": original}
 	node = updateRecheckNode(t, ctx, c, node)
 	second := issuedRecheckEvent(t, ctx, c, node, pod)
 	require.NotEqual(t, first.Metadata[gpuRecheckRequestKey], second.Metadata[gpuRecheckRequestKey])
 	require.ErrorIs(t, validateRecheck(ctx, c, first), errStaleGPURecheck)
 	require.NoError(t, validateRecheck(ctx, c, second))
+}
+
+func TestGPURecheckAPIFailureIsRetryable(t *testing.T) {
+	for _, resource := range []string{"nodes", "pods"} {
+		t.Run(resource, func(t *testing.T) {
+			ctx, c, node, pod := recheckFixture(t)
+			event := issuedRecheckEvent(t, ctx, c, node, pod)
+			pod, err := e2eTestClient.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+			require.NoError(t, err)
+			clientset := fake.NewSimpleClientset(node, pod)
+			unavailable := apierrors.NewServiceUnavailable("temporary API outage")
+			clientset.PrependReactor("get", resource, func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, unavailable
+			})
+			c.client.Clientset = clientset
+			r := &Reconciler{gpuRecheck: c, k8sClient: c.client}
+			status, err := r.handleEventWithGPURecheck(ctx, &model.HealthEventWithStatus{HealthEvent: event}, nil, rulesetsConfig{})
+			require.Nil(t, status)
+			require.ErrorIs(t, err, unavailable)
+			require.False(t, coldstart.IsPermanentError(err))
+		})
+	}
 }
 
 func TestGPURecheckManualHoldDoesNotRearm(t *testing.T) {
