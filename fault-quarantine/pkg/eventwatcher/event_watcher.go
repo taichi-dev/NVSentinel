@@ -26,6 +26,7 @@ import (
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
 	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/coldstart"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/metrics"
 	"github.com/nvidia/nvsentinel/store-client/pkg/client"
 	"github.com/nvidia/nvsentinel/store-client/pkg/query"
@@ -38,13 +39,13 @@ const (
 	liveRecoveryStoreRetryInitialWait = 100 * time.Millisecond
 )
 
-type liveSkipCompletionError struct {
+type liveEventCompletionError struct {
 	err error
 }
 
-func (e *liveSkipCompletionError) Error() string       { return e.err.Error() }
-func (e *liveSkipCompletionError) Unwrap() error       { return e.err }
-func (e *liveSkipCompletionError) withholdCheckpoint() {}
+func (e *liveEventCompletionError) Error() string       { return e.err.Error() }
+func (e *liveEventCompletionError) Unwrap() error       { return e.err }
+func (e *liveEventCompletionError) withholdCheckpoint() {}
 
 type recoveryOverlapLookupError struct {
 	err error
@@ -287,6 +288,10 @@ func (w *EventWatcher) processEvent(ctx context.Context, event client.Event) err
 
 	processed, err := w.processHealthEvent(ctx, &healthEventWithStatus, recordUUID, eventID)
 	if err != nil {
+		if recheckNeedsReplay(healthEventWithStatus.HealthEvent, err) {
+			return &liveEventCompletionError{err: err}
+		}
+
 		return err
 	}
 
@@ -381,7 +386,7 @@ func (w *EventWatcher) completeLiveEventIfSkipped(
 	if err != nil {
 		metrics.ProcessingErrors.WithLabelValues("update_recovery_completion_status_error").Inc()
 
-		return &liveSkipCompletionError{err: fmt.Errorf(
+		return &liveEventCompletionError{err: fmt.Errorf(
 			"failed to record skipped live event completion: %w", err)}
 	}
 
@@ -597,7 +602,7 @@ func (w *EventWatcher) processHealthEvent(
 	}
 
 	status, processErr := w.processEventCallback(ctx, healthEventWithStatus)
-	if withholdTransientRecoveryStatus(ctx, processErr) {
+	if withholdProcessingStatus(ctx, healthEventWithStatus.HealthEvent, processErr) {
 		// A partial status would remove this event from the next cold-start query,
 		// permanently losing any rule action skipped by the transient failure.
 		metrics.EventHandlingDuration.Observe(time.Since(startTime).Seconds())
@@ -626,8 +631,13 @@ func (w *EventWatcher) processHealthEvent(
 	return status != nil, processErr
 }
 
-func withholdTransientRecoveryStatus(ctx context.Context, err error) bool {
-	return coldstart.IsRecoveryContext(ctx) && err != nil && !coldstart.IsPermanentError(err)
+func recheckNeedsReplay(event *protos.HealthEvent, err error) bool {
+	return event.GetMetadata()[common.GPURecheckRequestKey] != "" && err != nil && !coldstart.IsPermanentError(err)
+}
+
+func withholdProcessingStatus(ctx context.Context, event *protos.HealthEvent, err error) bool {
+	return recheckNeedsReplay(event, err) ||
+		(coldstart.IsRecoveryContext(ctx) && err != nil && !coldstart.IsPermanentError(err))
 }
 
 func EmitNodeQuarantineDuration(status *model.Status, healthEventWithStatus *model.HealthEventWithStatus) {

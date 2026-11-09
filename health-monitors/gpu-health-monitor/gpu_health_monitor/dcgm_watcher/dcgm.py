@@ -618,6 +618,60 @@ class DCGMWatcher:
 
         return gpu_serials
 
+    def _is_non_actionable_sram_dbe(self, dcgm_group: pydcgm.DcgmGroup, gpu_id: int) -> bool:
+        # The volatile DBE total includes SRAM errors that can outlive their
+        # recovery action. Exempt only SRAM-only counts with a live driver NONE
+        # and no SRAM threshold breach or pending/failed row remapping.
+        # Unsupported telemetry retains the DCGM incident on older versions.
+        recovery_field = _first_defined(
+            dcgm_fields, "DCGM_FI_DEV_GPU_RECOVERY_ACTION", "DCGM_FI_DEV_GET_GPU_RECOVERY_ACTION"
+        )
+        memory_fields = (
+            "ECC_DBE_VOL_TOTAL",
+            "ECC_DBE_VOL_SRM",
+            "ECC_DBE_VOL_DEV",
+            "THRESHOLD_SRM",
+            "ROW_REMAP_PENDING",
+            "ROW_REMAP_FAILURE",
+        )
+        field_ids = [recovery_field] + [getattr(dcgm_fields, "DCGM_FI_DEV_" + name, None) for name in memory_fields]
+        if None in field_ids:
+            return False
+        entity = dcgm_structs.c_dcgmGroupEntityPair_t()
+        entity.entityGroupId, entity.entityId = dcgm_fields.DCGM_FE_GPU, gpu_id
+        try:
+            samples = dcgm_agent.dcgmEntitiesGetLatestValues(
+                dcgm_group._dcgmHandle.handle, [entity], field_ids, dcgm_structs.DCGM_FV_FLAG_LIVE_DATA
+            )
+        except Exception as exc:
+            log.warning(
+                "Cannot confirm current SRAM recovery state for GPU %s; retaining ECC incident: %s", gpu_id, exc
+            )
+            return False
+        values = {}
+        for sample in samples:
+            if (
+                sample.entityGroupId != dcgm_fields.DCGM_FE_GPU
+                or sample.entityId != gpu_id
+                or sample.fieldId not in field_ids
+                or sample.fieldId in values
+                or sample.status != dcgm_structs.DCGM_ST_OK
+                or sample.fieldType != ord(dcgm_fields.DCGM_FT_INT64)
+                or sample.ts <= 0
+                or sample.value.i64 < 0
+                or dcgmvalue.DCGM_INT64_IS_BLANK(sample.value.i64)
+            ):
+                return False
+            values[sample.fieldId] = sample.value.i64
+        if len(values) != len(field_ids):
+            return False
+        action, total, sram, dram, threshold, pending, failed = [values[field] for field in field_ids]
+        if action != 0 or total != sram or sram == 0 or any((dram, threshold, pending, failed)):
+            return False
+        log.debug("GPU %s has %s SRAM DBE(s) without recovery, SRAM threshold, or row-remap flags", gpu_id, sram)
+        metrics.dcgm_health_check_suppressed_incidents.labels("DCGM_FR_VOLATILE_DBE_DETECTED").inc()
+        return True
+
     def _perform_health_check(self, dcgm_group: pydcgm.DcgmGroup) -> tuple[dict[str, types.HealthDetails], bool]:
         """
         Perform DCGM health check.
@@ -627,12 +681,15 @@ class DCGMWatcher:
             - health_status: dict of health details for each watch
             - connectivity_success: True if DCGM connection is successful, False otherwise
         """
+        observed_at = time.monotonic()
         try:
             with metrics.dcgm_api_latency.labels("health_check").time():
                 health_details = dcgm_group.health.Check()
             log.debug(f"initial health status is {health_details}")
 
             health_status = self._get_health_status_dict()
+            for details in health_status.values():
+                details.observed_at = observed_at
             incident_capacity = getattr(dcgm_structs, "DCGM_HEALTH_WATCH_MAX_INCIDENTS_V2", None)
             if incident_capacity is None:
                 incident_capacity = dcgm_structs.DCGM_HEALTH_WATCH_MAX_INCIDENTS
@@ -711,6 +768,14 @@ class DCGMWatcher:
                     continue
 
                 if self._is_suppressed_error_code(watch_name, entity_id, error_code):
+                    continue
+
+                if (
+                    watch_name == "DCGM_HEALTH_WATCH_MEM"
+                    and entity_group_id == dcgm_fields.DCGM_FE_GPU
+                    and error_code == "DCGM_FR_VOLATILE_DBE_DETECTED"
+                    and self._is_non_actionable_sram_dbe(dcgm_group, entity_id)
+                ):
                     continue
 
                 # Evaluated after suppression: a suppressed incident is not an

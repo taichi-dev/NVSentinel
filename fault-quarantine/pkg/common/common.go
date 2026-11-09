@@ -33,6 +33,9 @@ const (
 )
 
 const (
+	// GPURecheckRequestKey identifies a one-shot, fresh monitor confirmation.
+	GPURecheckRequestKey = "gpuRecheckRequest"
+
 	// Annotation keys for storing event on node which causes node to be cordoned or tainted
 	QuarantineHealthEventAnnotationKey                    = "quarantineHealthEvent"
 	QuarantineHealthEventAppliedTaintsAnnotationKey       = "quarantineHealthEventAppliedTaints"

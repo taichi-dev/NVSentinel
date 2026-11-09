@@ -752,6 +752,70 @@ func TestProcessEvent_LiveTransientFailureStillPersistsStatus(t *testing.T) {
 		"withholding partial status is recovery-only and must not change the established live path")
 }
 
+func TestWatchEvents_RecheckFailurePreservesReplay(t *testing.T) {
+	transient := errors.New("service temporarily unavailable")
+	permanent := coldstart.PermanentError(errors.New("invalid rule"))
+	for _, test := range []struct {
+		name       string
+		status     bool
+		processErr error
+		writeErr   error
+		retry      bool
+		writes     int
+	}{
+		{"guard read fails", false, transient, nil, true, 0},
+		{"partial quarantine fails", true, transient, nil, true, 0},
+		{"status write fails", true, nil, transient, true, 1},
+		{"permanent rule error", true, permanent, nil, false, 1},
+		{"mixed rule errors", true, errors.Join(permanent, transient), nil, true, 0},
+		{"permanent rule plus failed status write", true, permanent, transient, true, 1},
+		{"stale confirmation", false, nil, nil, false, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			document := storedHealthEvent("event-uuid")
+			document["healthevent"].(datastore.Event)["metadata"] = map[string]string{"gpuRecheckRequest": "request-1"}
+			event := &clientEventStub{document: document, eventID: "52", recordUUID: "event-uuid", token: []byte("resume-token")}
+			events := make(chan client.Event, 1)
+			events <- event
+			close(events)
+			stream := &changeStreamWatcherStub{events: events}
+			db := &databaseClientStub{updateErr: test.writeErr}
+			watcher := NewEventWatcher(stream, db, time.Minute, &objectIDStoreStub{})
+			watcher.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+				if test.status {
+					status := model.Quarantined
+					return &status, test.processErr
+				}
+				return nil, test.processErr
+			})
+			err := watcher.watchEvents(context.Background())
+			assert.Equal(t, test.writes, db.updateCalls)
+			if !test.retry {
+				require.NoError(t, err)
+				assert.Equal(t, 1, stream.markCalls)
+				return
+			}
+			require.ErrorIs(t, err, transient)
+			assert.Zero(t, stream.markCalls)
+			assert.Zero(t, db.completionCalls)
+
+			// Replay after recovery persists the successful result before checkpointing.
+			events = make(chan client.Event, 1)
+			events <- event
+			close(events)
+			stream.events = events
+			db.updateErr = nil
+			watcher.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+				status := model.Quarantined
+				return &status, nil
+			})
+			require.NoError(t, watcher.watchEvents(context.Background()))
+			assert.Equal(t, 1, stream.markCalls)
+			assert.Equal(t, test.writes+1, db.updateCalls)
+		})
+	}
+}
+
 func TestCompleteStoredEvents_MixedTerminalResults_PersistsAndDeduplicatesAll(t *testing.T) {
 	dbClient := &databaseClientStub{}
 	objectIDs := &objectIDStoreStub{}
