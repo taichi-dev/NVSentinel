@@ -27,6 +27,7 @@ import (
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/coldstart"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/config"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/healthEventsAnnotation"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/informer"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/nodecache"
 	"github.com/stretchr/testify/require"
@@ -36,6 +37,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
@@ -217,6 +219,116 @@ func TestGPURecheckAPIFailureIsRetryable(t *testing.T) {
 			require.False(t, coldstart.IsPermanentError(err))
 		})
 	}
+}
+
+func TestGPURecheckScopeExitDoesNotWaitForAPI(t *testing.T) {
+	ctx, c, node, pod := recheckFixture(t)
+	first := issuedRecheckEvent(t, ctx, c, node, pod)
+	slowNode, err := e2eTestClient.CoreV1().Nodes().Create(ctx, &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: node.Name + "-slow", Labels: node.Labels},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = e2eTestClient.CoreV1().Nodes().Delete(ctx, slowNode.Name, metav1.DeleteOptions{}) })
+	require.Eventually(t, func() bool {
+		_, err := c.client.NodeInformer.GetNode(slowNode.Name)
+		return err == nil
+	}, 5*time.Second, 10*time.Millisecond)
+	clientset := fake.NewSimpleClientset(node, slowNode, pod)
+	started, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	clientset.PrependReactor("get", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.(k8stesting.GetAction).GetName() == slowNode.Name {
+			close(started)
+			<-release
+		}
+		return false, nil, nil
+	})
+	c.client.Clientset = clientset
+	go func() { done <- c.reconcile(ctx) }()
+	defer func() {
+		close(release)
+		require.NoError(t, <-done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconcile did not reach the slow API call")
+	}
+	label := node.Labels["repair-test"]
+	delete(node.Labels, "repair-test")
+	node = updateRecheckNode(t, ctx, c, node)
+	require.Eventually(t, func() bool {
+		if !c.mu.TryLock() {
+			return false
+		}
+		defer c.mu.Unlock()
+		return c.enrolled[node.Name] == nil
+	}, time.Second, 10*time.Millisecond, "scope exits must invalidate old requests while unrelated API calls are blocked")
+	node.Labels = map[string]string{"repair-test": label}
+	node = updateRecheckNode(t, ctx, c, node)
+	// The live Node is eligible again, but the old enrollment has expired.
+	require.ErrorIs(t, c.guard(node, first), errStaleGPURecheck)
+}
+
+func TestGPURecheckAcceptsConfirmationAfterLostPatchResponse(t *testing.T) {
+	ctx, c, node, pod := recheckFixture(t)
+	event := issuedRecheckEvent(t, ctx, c, node, pod)
+	c.mu.Lock()
+	delete(c.enrolled, node.Name)
+	c.mu.Unlock()
+	clientset := fake.NewSimpleClientset(node, pod)
+	c.client.Clientset = clientset
+	responseLost := false
+	clientset.PrependReactor("patch", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if responseLost {
+			return false, nil, nil
+		}
+		responseLost = true
+		var patch struct {
+			Metadata struct {
+				Annotations map[string]string `json:"annotations"`
+			} `json:"metadata"`
+		}
+		require.NoError(t, json.Unmarshal(action.(k8stesting.PatchAction).GetPatch(), &patch))
+		updated := pod.DeepCopy()
+		updated.Annotations = patch.Metadata.Annotations
+		require.NoError(t, clientset.Tracker().Update(schema.GroupVersionResource{Version: "v1", Resource: "pods"}, updated, pod.Namespace))
+		return true, nil, apierrors.NewTimeoutError("patch committed but response lost", 1)
+	})
+	require.Error(t, c.reconcile(ctx))
+	updated, err := clientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	var request gpuRecheckRequest
+	require.NoError(t, json.Unmarshal([]byte(updated.Annotations[gpuRecheckAnnotation]), &request))
+	event.Metadata[gpuRecheckRequestKey] = request.ID
+	require.NoError(t, validateRecheck(ctx, c, event), "confirmation can arrive before the next request retry")
+	pending, err := c.pendingEnrollments()
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
+	require.NoError(t, c.reconcile(ctx))
+	updated, err = clientset.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	var retried gpuRecheckRequest
+	require.NoError(t, json.Unmarshal([]byte(updated.Annotations[gpuRecheckAnnotation]), &retried))
+	require.Equal(t, request.ID, retried.ID)
+
+	// A retry queued before the first GPU quarantines must not suppress the
+	// remaining GPU confirmations, even before complete() marks it handled.
+	annotation := healthEventsAnnotation.NewHealthEventsAnnotationMap()
+	require.True(t, annotation.AddOrUpdateEvent(event))
+	raw, err := json.Marshal(annotation)
+	require.NoError(t, err)
+	node.Annotations = map[string]string{common.QuarantineHealthEventAnnotationKey: string(raw)}
+	node.Spec.Unschedulable = true
+	_, err = clientset.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	for pendingNode, entry := range pending {
+		require.NoError(t, c.request(ctx, pendingNode, entry))
+	}
+	second := proto.Clone(event).(*protos.HealthEvent)
+	second.Id = generateTestID()
+	second.EntitiesImpacted[0].EntityValue = "2"
+	require.NoError(t, validateRecheck(ctx, c, second))
 }
 
 func TestGPURecheckManualHoldDoesNotRearm(t *testing.T) {

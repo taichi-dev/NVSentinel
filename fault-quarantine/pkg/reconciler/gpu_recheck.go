@@ -59,11 +59,12 @@ type gpuRecheckRequest struct {
 }
 
 type gpuRecheckEnrollment struct {
-	request gpuRecheckRequest
-	skipped bool
-	podUID  types.UID
-	podName string
-	handled bool
+	request   gpuRecheckRequest
+	skipped   bool
+	podUID    types.UID
+	podName   string
+	requested bool
+	handled   bool
 }
 
 type gpuRechecker struct {
@@ -136,22 +137,39 @@ func (c *gpuRechecker) run(ctx context.Context) {
 // a monitor make API calls; completing repair does not rearm an enrollment.
 // This opt-in requester supports one FQ replica.
 func (c *gpuRechecker) reconcile(ctx context.Context) error {
+	pending, err := c.pendingEnrollments()
+	if err != nil {
+		return err
+	}
+
+	var failures []error
+
+	for node, entry := range pending {
+		if err := c.request(ctx, node, entry); err != nil {
+			failures = append(failures, err)
+		}
+	}
+
+	return errors.Join(failures...)
+}
+
+func (c *gpuRechecker) pendingEnrollments() (map[*corev1.Node]*gpuRecheckEnrollment, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	nodes, err := c.client.NodeInformer.Lister().List(c.selector)
 	if err != nil {
-		return fmt.Errorf("list cached recheck nodes: %w", err)
+		return nil, fmt.Errorf("list cached recheck nodes: %w", err)
 	}
 
 	present := make(map[string]bool, len(nodes))
 
-	var failures []error
+	pending := make(map[*corev1.Node]*gpuRecheckEnrollment)
 
 	for _, node := range nodes {
 		present[node.Name] = true
-		if err := c.enroll(ctx, node); err != nil {
-			failures = append(failures, err)
+		if entry := c.enroll(node); entry != nil {
+			pending[node] = entry
 		}
 	}
 
@@ -161,10 +179,10 @@ func (c *gpuRechecker) reconcile(ctx context.Context) error {
 		}
 	}
 
-	return errors.Join(failures...)
+	return pending, nil
 }
 
-func (c *gpuRechecker) enroll(ctx context.Context, node *corev1.Node) error {
+func (c *gpuRechecker) enroll(node *corev1.Node) *gpuRecheckEnrollment {
 	entry := c.enrolled[node.Name]
 	if entry == nil || entry.request.NodeUID != string(node.UID) {
 		entry = &gpuRecheckEnrollment{
@@ -174,11 +192,11 @@ func (c *gpuRechecker) enroll(ctx context.Context, node *corev1.Node) error {
 		c.enrolled[node.Name] = entry
 	}
 
-	if entry.skipped || entry.podUID != "" {
+	if entry.skipped || entry.requested || entry.handled {
 		return nil
 	}
 
-	return c.request(ctx, node, entry)
+	return entry
 }
 
 func (c *gpuRechecker) request(ctx context.Context, node *corev1.Node, entry *gpuRecheckEnrollment) error {
@@ -188,7 +206,17 @@ func (c *gpuRechecker) request(ctx context.Context, node *corev1.Node, entry *gp
 	}
 
 	if current.UID != node.UID || !c.selector.Matches(labels.Set(current.Labels)) || !recheckEligible(current) {
-		entry.skipped = true
+		// Another GPU confirmation can start this repair while a request retry
+		// is pending. Preserve the remaining confirmations of that same request.
+		_, sameRequest := recheckRecorded(current, &protos.HealthEvent{Metadata: map[string]string{
+			gpuRecheckRequestKey: entry.request.ID, gpuRecheckNodeKey: entry.request.NodeUID,
+		}})
+
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		entry.skipped = !sameRequest
+
 		return nil
 	}
 
@@ -204,6 +232,12 @@ func (c *gpuRechecker) request(ctx context.Context, node *corev1.Node, entry *gp
 		return nil
 	}
 
+	return c.publishRequest(ctx, node, pod, entry)
+}
+
+func (c *gpuRechecker) publishRequest(
+	ctx context.Context, node *corev1.Node, pod *corev1.Pod, entry *gpuRecheckEnrollment,
+) error {
 	raw, err := json.Marshal(entry.request)
 	if err != nil {
 		return fmt.Errorf("encode GPU recheck request: %w", err)
@@ -217,13 +251,28 @@ func (c *gpuRechecker) request(ctx context.Context, node *corev1.Node, entry *gp
 		return fmt.Errorf("encode GPU recheck patch: %w", err)
 	}
 
+	// Publish the expected identity before the API call: a monitor can confirm
+	// before Patch returns, including when the response is lost. Retry that same
+	// request after errors while leaving its confirmation valid.
+	c.mu.Lock()
+	if c.enrolled[node.Name] != entry {
+		c.mu.Unlock()
+		return nil
+	}
+
+	entry.podUID, entry.podName = pod.UID, pod.Name
+	c.mu.Unlock()
+
 	_, err = c.client.Clientset.CoreV1().Pods(pod.Namespace).Patch(
 		ctx, pod.Name, types.MergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
 		return fmt.Errorf("request GPU recheck on %s: %w", node.Name, err)
 	}
 
-	entry.podUID, entry.podName = pod.UID, pod.Name
+	c.mu.Lock()
+	entry.requested = true
+	c.mu.Unlock()
+
 	slog.InfoContext(ctx, "Requested fresh GPU ECC observation", "node", node.Name, "request", entry.request.ID)
 
 	return nil
