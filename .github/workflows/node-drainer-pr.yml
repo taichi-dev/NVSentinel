@@ -1,0 +1,59 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Node Drainer PR
+
+on:
+  pull_request:
+    paths:
+      - "node-drainer/**"
+      - "commons/**"
+      - "data-models/**"
+      - "store-client/**"
+      - "fault-quarantine/**"
+      - "distros/kubernetes/nvsentinel/charts/node-drainer/**"
+      - "make/**"
+      - ".versions.yaml"
+      - ".golangci.yml"
+      - ".github/actions/setup-ci-env/**"
+      - ".github/actions/upload-test-artifacts/**"
+      - ".github/workflows/node-drainer-pr.yml"
+      - "scripts/retry.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: node-drainer-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  node-drainer:
+    # The upstream workflow uses NVIDIA runners and only runs in its repository.
+    if: github.repository == 'taichi-dev/NVSentinel'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      KUBECONFIG: /dev/null
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up repository build tools
+        uses: ./.github/actions/setup-ci-env
+      - name: Download Go modules
+        working-directory: node-drainer
+        run: ../scripts/retry.sh go mod download
+      - name: Lint and test with race detection and envtest
+        run: make -C node-drainer lint-test
+      - name: Lint node-drainer chart
+        run: helm lint distros/kubernetes/nvsentinel/charts/node-drainer
+      - name: Upload test results
+        if: always()
+        uses: ./.github/actions/upload-test-artifacts
+        with:
+          component-name: node-drainer
+          file-paths: |
+            node-drainer/coverage.xml
+            node-drainer/coverage.txt
+            node-drainer/report.xml
