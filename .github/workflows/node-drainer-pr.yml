@@ -11,7 +11,7 @@ on:
       - "data-models/**"
       - "store-client/**"
       - "fault-quarantine/**"
-      - "distros/kubernetes/nvsentinel/charts/node-drainer/**"
+      - "distros/kubernetes/nvsentinel/**"
       - "make/**"
       - ".versions.yaml"
       - ".golangci.yml"
@@ -46,8 +46,8 @@ jobs:
         run: ../scripts/retry.sh go mod download
       - name: Lint and test with race detection and envtest
         run: make -C node-drainer lint-test
-      - name: Lint node-drainer chart
-        run: helm lint distros/kubernetes/nvsentinel/charts/node-drainer
+      - name: Lint chart with shared umbrella helpers
+        run: helm lint distros/kubernetes/nvsentinel
       - name: Upload test results
         if: always()
         uses: ./.github/actions/upload-test-artifacts
