@@ -67,6 +67,7 @@ type TomlConfig struct {
 	// NotReadyTimeoutMinutes is the time after which a pod in NotReady state is considered stuck
 	NotReadyTimeoutMinutes int               `toml:"notReadyTimeoutMinutes"`
 	DrainGPUPods           bool              `toml:"drainGPUPods"`
+	RequirePodTermination  bool              `toml:"requirePodTermination"`
 	UserNamespaces         []UserNamespace   `toml:"userNamespaces"`
 	PodDrainPolicies       []PodDrainPolicy  `toml:"podDrainPolicies"`
 	CustomDrain            CustomDrainConfig `toml:"customDrain"`
@@ -198,6 +199,10 @@ func validateAndSetDefaults(config *TomlConfig) (*TomlConfig, error) {
 		return nil, err
 	}
 
+	if err := validatePodTerminationPolicy(config); err != nil {
+		return nil, err
+	}
+
 	if config.DeleteAfterTimeoutMinutes == 0 {
 		config.DeleteAfterTimeoutMinutes = 60 // Default: 60 minutes
 	}
@@ -215,6 +220,27 @@ func validateAndSetDefaults(config *TomlConfig) (*TomlConfig, error) {
 	}
 
 	return config, nil
+}
+
+// validatePodTerminationPolicy rejects policies that remove pods before termination is observed.
+func validatePodTerminationPolicy(config *TomlConfig) error {
+	if !config.RequirePodTermination {
+		return nil
+	}
+
+	for _, ns := range config.UserNamespaces {
+		if ns.Mode == ModeDeleteAfterTimeout {
+			return fmt.Errorf("requirePodTermination is incompatible with DeleteAfterTimeout in namespace %q", ns.Name)
+		}
+	}
+
+	for _, policy := range config.PodDrainPolicies {
+		if policy.Mode == ModeDeleteAfterTimeout {
+			return fmt.Errorf("requirePodTermination is incompatible with DeleteAfterTimeout in policy %q", policy.Name)
+		}
+	}
+
+	return nil
 }
 
 type ReconcilerConfig struct {
