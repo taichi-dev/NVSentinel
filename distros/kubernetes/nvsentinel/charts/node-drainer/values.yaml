@@ -62,6 +62,14 @@ deleteAfterTimeoutMinutes: 60
 # Default: 5 minutes if not specified (validated in config.go)
 notReadyTimeoutMinutes: 5
 
+# Wait for selected pods to disappear or reach a terminal phase. Retain NotReady
+# and stuck Terminating pods in the drain scope, preserve their termination grace
+# periods and disable Immediate timeout force-deletion. PDBs and graceful
+# termination can therefore block repair.
+# Incompatible with DeleteAfterTimeout policies. Configure before deployment;
+# changing this to false restores the timeout behavior for pending drains.
+requirePodTermination: false
+
 # Flag to restrict draining to GPU workloads
 # If enabled, only pods with the metadata-collector device annotation
 # (indicating assigned GPU devices) are eligible for draining. Pods without

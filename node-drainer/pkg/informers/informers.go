@@ -60,11 +60,18 @@ type Informers struct {
 	clientset              kubernetes.Interface
 	notReadyTimeoutMinutes *int
 	drainGPUPods           bool
+	requirePodTermination  bool
 	dryRunMode             []string
 }
 
 // PodFilter narrows an action to pods assigned to its drain mode.
 type PodFilter func(*v1.Pod) bool
+
+// SetRequirePodTermination configures native drains to wait for pod termination.
+// Call this before starting the informers.
+func (i *Informers) SetRequirePodTermination(required bool) {
+	i.requirePodTermination = required
+}
 
 // NewInformers creates the pod and node informers used to observe drainable workloads.
 // The pod cache retains only the labels named by podLabelKeys, and the node cache only
@@ -626,10 +633,12 @@ func (i *Informers) filterEvictablePods(pods []*v1.Pod, partialDrainEntity *prot
 			continue
 		}
 
-		// Only skip draining for pods stuck terminating or not ready if we are executing a full drain.
+		// Legacy full drains skip pods stuck terminating or not ready. Strict drains
+		// keep them until termination is observed, including AllowCompletion pods.
 		// There is no guarantee that a pod in either state does not still have a GPU device handle that
 		// would cause a GPU reset to fail.
-		if partialDrainEntity == nil && (i.isPodStuckInTerminating(pod) || i.isPodNotReady(pod)) {
+		if !i.requirePodTermination && partialDrainEntity == nil &&
+			(i.isPodStuckInTerminating(pod) || i.isPodNotReady(pod)) {
 			slog.Info("Ignoring pod in namespace on node",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
@@ -686,17 +695,21 @@ func (i *Informers) isDaemonSetPod(pod *v1.Pod) bool {
 	return false
 }
 
+func podTerminationGracePeriod(pod *v1.Pod) time.Duration {
+	if pod.Spec.TerminationGracePeriodSeconds != nil {
+		return time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * time.Second
+	}
+
+	return 30 * time.Second
+}
+
 func (i *Informers) isPodStuckInTerminating(pod *v1.Pod) bool {
 	if pod.DeletionTimestamp == nil {
 		return false
 	}
 
-	gracePeriod := 30
-	if pod.Spec.TerminationGracePeriodSeconds != nil {
-		gracePeriod = int(*pod.Spec.TerminationGracePeriodSeconds)
-	}
-
-	timeoutThreshold := pod.DeletionTimestamp.Add(time.Duration(gracePeriod) * time.Second)
+	gracePeriod := podTerminationGracePeriod(pod)
+	timeoutThreshold := pod.DeletionTimestamp.Add(gracePeriod)
 
 	// If current time is beyond the timeout threshold, pod is considered stuck
 	if time.Now().After(timeoutThreshold) {
@@ -704,7 +717,7 @@ func (i *Informers) isPodStuckInTerminating(pod *v1.Pod) bool {
 			"pod", pod.Name,
 			"namespace", pod.Namespace,
 			"deletionTimestamp", pod.DeletionTimestamp,
-			"gracePeriod", gracePeriod,
+			"gracePeriod", gracePeriod.Seconds(),
 			"timeoutThreshold", timeoutThreshold)
 
 		return true
@@ -829,6 +842,11 @@ func (i *Informers) sendEvictionRequestForPod(ctx context.Context, namespace str
 			DryRun:             i.dryRunMode,
 			Preconditions:      podDeletionPreconditions(pod),
 		},
+	}
+
+	if i.requirePodTermination {
+		// Let the API server use the pod's terminationGracePeriodSeconds.
+		eviction.DeleteOptions.GracePeriodSeconds = nil
 	}
 
 	err := i.clientset.PolicyV1().Evictions(pod.Namespace).Evict(ctx, eviction)
@@ -1199,17 +1217,19 @@ func (i *Informers) CheckIfObservedPodsAreEvictedInImmediateMode(ctx context.Con
 		return true
 	}
 
+	if i.requirePodTermination {
+		slog.InfoContext(ctx, "Waiting for pod termination before completing drain", "node", nodeName,
+			"remainingPods", len(remainingPods))
+
+		return false
+	}
+
 	now := time.Now()
 	shouldForceDelete := false
 
 	for _, pod := range remainingPods {
 		if pod.DeletionTimestamp != nil {
-			gracePeriod := 30 * time.Second
-			if pod.Spec.TerminationGracePeriodSeconds != nil {
-				gracePeriod = time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * time.Second
-			}
-
-			deletionDeadline := pod.DeletionTimestamp.Add(gracePeriod).Add(timeout)
+			deletionDeadline := pod.DeletionTimestamp.Add(podTerminationGracePeriod(pod)).Add(timeout)
 			if now.After(deletionDeadline) {
 				shouldForceDelete = true
 				break
