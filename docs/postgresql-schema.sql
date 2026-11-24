@@ -132,6 +132,8 @@ AND (
     document->'healtheventstatus'->>'faultquarantinerecovery' IS NULL
     OR document->'healtheventstatus'->>'faultquarantinerecovery' = ''
 );
+CREATE INDEX IF NOT EXISTS idx_health_events_awaiting_reboot ON health_events (created_at, id)
+WHERE document->'healtheventstatus'->>'faultquarantinerecovery' = 'awaitingReboot';
 CREATE INDEX IF NOT EXISTS idx_health_events_updated_desc ON health_events(updated_at DESC);
 
 -- Unique partial index behind the idempotency keys the platform connectors write

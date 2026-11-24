@@ -17,6 +17,8 @@ package common
 import (
 	"errors"
 
+	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
+
 	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
 )
 
@@ -40,11 +42,13 @@ const (
 )
 
 const (
+	ContactSupportHold = "nvsentinel.nvidia.com/contact-support-hold"
+
 	// GPURecheckRequestKey identifies a one-shot, fresh monitor confirmation.
 	GPURecheckRequestKey = "gpuRecheckRequest"
 
 	// Annotation keys for storing event on node which causes node to be cordoned or tainted
-	QuarantineHealthEventAnnotationKey                    = "quarantineHealthEvent"
+	QuarantineHealthEventAnnotationKey                    = annotation.QuarantineHealthEvent
 	QuarantineHealthEventAppliedTaintsAnnotationKey       = "quarantineHealthEventAppliedTaints"
 	QuarantineHealthEventAppliedLabelsAnnotationKey       = "quarantineHealthEventAppliedLabels"
 	QuarantineHealthEventIsCordonedAnnotationKey          = "quarantineHealthEventIsCordoned"
@@ -81,6 +85,9 @@ const (
 // and fault-quarantine then concludes no quarantine is in progress and
 // re-cordons a node it has already handled.
 var QuarantineAnnotationKeys = []string{
+	ContactSupportHold,
+	annotation.QuarantineValidationRequest,
+	annotation.ValidationSession,
 	QuarantineHealthEventAnnotationKey,
 	QuarantineHealthEventAppliedTaintsAnnotationKey,
 	QuarantineHealthEventAppliedLabelsAnnotationKey,

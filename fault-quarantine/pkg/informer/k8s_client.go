@@ -235,26 +235,18 @@ func (c *FaultQuarantineClient) UpdateNode(ctx context.Context, nodeName string,
 
 	defer mu.(*sync.Mutex).Unlock()
 
-	cached := c.cachedNodeForPatch(nodeName)
-	if guard, ok := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error); ok {
-		cached = nil // A recheck guard needs all current labels and annotations.
-		mutate := updateFn
-		updateFn = func(node *v1.Node) error {
-			if err := guard(node); err != nil {
-				return err
-			}
+	nodes := c.Clientset.CoreV1().Nodes()
 
-			return mutate(node)
-		}
+	var (
+		changed bool
+		err     error
+	)
+	if guard, ok := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error); ok {
+		changed, err = c.nodePatcher.PatchGuarded(ctx, nodes, nodeName, guard, updateFn)
+	} else {
+		changed, err = c.nodePatcher.Patch(ctx, nodes, nodeName, c.cachedNodeForPatch(nodeName), updateFn)
 	}
 
-	changed, err := c.nodePatcher.Patch(
-		ctx,
-		c.Clientset.CoreV1().Nodes(),
-		nodeName,
-		cached,
-		updateFn,
-	)
 	if err != nil {
 		return err
 	}

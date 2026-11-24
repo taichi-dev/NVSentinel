@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nvidia/nvsentinel/commons/pkg/tracing"
@@ -29,6 +30,7 @@ import (
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/metrics"
 	"github.com/nvidia/nvsentinel/store-client/pkg/client"
+	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
 	"github.com/nvidia/nvsentinel/store-client/pkg/query"
 	"go.opentelemetry.io/otel/attribute"
 )
@@ -60,7 +62,11 @@ type checkpointWithholdingError interface {
 	withholdCheckpoint()
 }
 
+type rebootRetryKey struct{}
+
 type EventWatcher struct {
+	rebootStore          datastore.HealthEventStore
+	liveStarted          atomic.Bool
 	changeStreamWatcher  client.ChangeStreamWatcher
 	databaseClient       client.DatabaseClient
 	processEventCallback func(
@@ -111,6 +117,13 @@ func NewEventWatcher(
 	}
 }
 
+// ConfigureRebootRecovery resumes durably deferred recoveries independently of the stream checkpoint.
+func (w *EventWatcher) ConfigureRebootRecovery(enabled bool, store datastore.HealthEventStore) {
+	if enabled {
+		w.rebootStore = store
+	}
+}
+
 func (w *EventWatcher) SetProcessEventCallback(callback func(ctx context.Context,
 	event *model.HealthEventWithStatus) (*model.Status, error)) {
 	w.processEventCallback = callback
@@ -153,6 +166,8 @@ func (w *EventWatcher) Start(ctx context.Context) error {
 
 		return nil //nolint:nilerr // Cancellation is the expected shutdown path.
 	}
+
+	w.liveStarted.Store(true)
 
 	w.armRecoveredEventExpiry(time.Now())
 	go w.expireRecoveredEventIDs(ctx)
@@ -215,28 +230,96 @@ func (w *EventWatcher) closeAfterColdStart(ctx context.Context) {
 }
 
 func (w *EventWatcher) watchEvents(ctx context.Context) error {
-	for event := range w.changeStreamWatcher.Events() {
-		metrics.TotalEventsReceived.Inc()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-		if processErr := w.processEvent(ctx, event); processErr != nil {
-			var withholdErr checkpointWithholdingError
-			if errors.As(processErr, &withholdErr) {
-				return fmt.Errorf("live event requires replay before checkpointing: %w", processErr)
+	var pending <-chan datastore.HealthEventWithStatus
+
+	if w.rebootStore != nil {
+		records := make(chan datastore.HealthEventWithStatus)
+
+		pending = records
+		go w.scanRebootRecoveries(ctx, records)
+	}
+
+	live := w.changeStreamWatcher.Events()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case record := <-pending:
+			retryCtx, stop := context.WithTimeout(context.WithValue(ctx, rebootRetryKey{}, true), 10*time.Second)
+			err := coldstart.RetryRebootRecovery(retryCtx, w.rebootStore, w, record)
+
+			stop()
+
+			if err != nil {
+				slog.ErrorContext(ctx, "Deferred reboot recovery failed", "error", err)
+			}
+		case event, open := <-live:
+			if !open {
+				return nil
 			}
 
-			slog.ErrorContext(ctx, "Event processing failed, but still marking as processed to proceed ahead",
-				"error", processErr)
+			if err := w.processAndCheckpoint(ctx, event); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (w *EventWatcher) scanRebootRecoveries(ctx context.Context, records chan<- datastore.HealthEventWithStatus) {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	filter := query.New().Build(query.Eq(coldstart.RecoveryCompletionStatusPath, coldstart.AwaitingRebootValue))
+	for {
+		err := w.rebootStore.FindHealthEventsByQueryBatched(ctx, filter, 64,
+			func(batch []datastore.HealthEventWithStatus) error {
+				for _, record := range batch {
+					select {
+					case records <- record:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+
+				return nil
+			})
+		if err != nil && ctx.Err() == nil {
+			slog.ErrorContext(ctx, "Scan deferred reboot recoveries", "error", err)
 		}
 
-		// Extract the resume token from the event to avoid race condition
-		// where the change stream cursor advances before we call MarkProcessed
-		resumeToken := event.GetResumeToken()
-		if err := w.changeStreamWatcher.MarkProcessed(ctx, resumeToken); err != nil {
-			metrics.ProcessingErrors.WithLabelValues("mark_processed_error").Inc()
-			slog.ErrorContext(ctx, "Failed to mark event as processed", "error", err)
-
-			return fmt.Errorf("failed to mark event as processed: %w", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
+	}
+}
+
+func (w *EventWatcher) processAndCheckpoint(ctx context.Context, event client.Event) error {
+	metrics.TotalEventsReceived.Inc()
+
+	if processErr := w.processEvent(ctx, event); processErr != nil {
+		var withholdErr checkpointWithholdingError
+		if errors.As(processErr, &withholdErr) {
+			return fmt.Errorf("live event requires replay before checkpointing: %w", processErr)
+		}
+
+		slog.ErrorContext(ctx, "Event processing failed, but still marking as processed to proceed ahead",
+			"error", processErr)
+	}
+
+	// Extract the resume token from the event to avoid race condition
+	// where the change stream cursor advances before we call MarkProcessed
+	resumeToken := event.GetResumeToken()
+	if err := w.changeStreamWatcher.MarkProcessed(ctx, resumeToken); err != nil {
+		metrics.ProcessingErrors.WithLabelValues("mark_processed_error").Inc()
+		slog.ErrorContext(ctx, "Failed to mark event as processed", "error", err)
+
+		return fmt.Errorf("failed to mark event as processed: %w", err)
 	}
 
 	return nil
@@ -288,14 +371,36 @@ func (w *EventWatcher) processEvent(ctx context.Context, event client.Event) err
 
 	processed, err := w.processHealthEvent(ctx, &healthEventWithStatus, recordUUID, eventID)
 	if err != nil {
-		if errors.Is(err, common.ErrRebootValidationPending) || recheckNeedsReplay(healthEventWithStatus.HealthEvent, err) {
-			return &liveEventCompletionError{err: err}
-		}
-
-		return err
+		return w.liveProcessingError(ctx, recordUUID, healthEventWithStatus.HealthEvent, err)
 	}
 
 	return w.completeLiveEventIfSkipped(ctx, recordUUID, processed)
+}
+
+func (w *EventWatcher) liveProcessingError(ctx context.Context, recordUUID string,
+	event *protos.HealthEvent, err error) error {
+	if errors.Is(err, common.ErrRebootValidationPending) {
+		return w.persistRebootWait(ctx, recordUUID)
+	}
+
+	if (w.rebootStore != nil && !coldstart.IsPermanentError(err)) ||
+		recheckNeedsReplay(event, err) {
+		return &liveEventCompletionError{err: err}
+	}
+
+	return err
+}
+
+func (w *EventWatcher) persistRebootWait(ctx context.Context, id string) error {
+	err := retryLiveRecoveryStoreOperation(ctx, func() error {
+		return w.databaseClient.UpdateDocumentStatus(ctx, id,
+			coldstart.RecoveryCompletionStatusPath, coldstart.AwaitingRebootValue)
+	})
+	if err != nil {
+		return &liveEventCompletionError{err: fmt.Errorf("persist deferred reboot recovery: %w", err)}
+	}
+
+	return nil
 }
 
 func (w *EventWatcher) shouldSkipRecoveredLiveEvent(
@@ -335,6 +440,7 @@ func (w *EventWatcher) recoveryOverlapEventAlreadyTerminal(
 	}
 
 	nodeStatusPath := "healtheventstatus.nodequarantined"
+
 	terminalStatus := query.Or(
 		query.Eq(coldstart.RecoveryCompletionStatusPath, coldstart.RecoveryCompletionValue),
 		query.And(
@@ -343,6 +449,11 @@ func (w *EventWatcher) recoveryOverlapEventAlreadyTerminal(
 			query.Ne(nodeStatusPath, string(model.StatusNotStarted)),
 		),
 	)
+	if w.rebootStore != nil {
+		terminalStatus = query.Or(terminalStatus,
+			query.Eq(coldstart.RecoveryCompletionStatusPath, coldstart.AwaitingRebootValue))
+	}
+
 	filter := query.New().Build(query.And(query.Eq("_id", recordUUID), terminalStatus))
 	limit := int64(1)
 
@@ -441,6 +552,14 @@ func (w *EventWatcher) ProcessStoredEvent(
 
 	processed, err := w.processHealthEvent(
 		recoveryCtx, &healthEventWithStatus, recordUUID, recordUUID)
+	if errors.Is(err, common.ErrRebootValidationPending) {
+		if ctx.Value(rebootRetryKey{}) == true {
+			return coldstart.ProcessResultDeferred, nil
+		}
+
+		return coldstart.ProcessResultDeferred, w.persistRebootWait(ctx, recordUUID)
+	}
+
 	if err != nil {
 		if !coldstart.IsPermanentError(err) {
 			return coldstart.ProcessResultFailed, fmt.Errorf("recovered event processing failed: %w", err)
@@ -526,7 +645,12 @@ func (w *EventWatcher) rememberRecoveredEvent(eventID string) {
 	// Keep an unarmed deadline until Start gives every recovered ID the same
 	// retention window. Starting it here could expire early IDs during a long
 	// cold start.
-	w.recoveredEventIDs.Store(eventID, time.Time{})
+	var expiry time.Time
+	if w.liveStarted.Load() {
+		expiry = time.Now().Add(recoveredEventDedupRetention)
+	}
+
+	w.recoveredEventIDs.Store(eventID, expiry)
 }
 
 func (w *EventWatcher) armRecoveredEventExpiry(now time.Time) {

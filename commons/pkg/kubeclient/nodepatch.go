@@ -51,6 +51,23 @@ func (p *NodePatcher) Patch(
 	cached *v1.Node,
 	mutate func(*v1.Node) error,
 ) (bool, error) {
+	return p.patch(ctx, nodes, nodeName, cached, mutate, false)
+}
+
+// PatchGuarded rechecks a live precondition on every retry, including metadata-only writes.
+func (p *NodePatcher) PatchGuarded(ctx context.Context, nodes typedcorev1.NodeInterface, nodeName string,
+	guard, mutate func(*v1.Node) error) (bool, error) {
+	return p.patch(ctx, nodes, nodeName, nil, func(node *v1.Node) error {
+		if err := guard(node); err != nil {
+			return err
+		}
+
+		return mutate(node)
+	}, true)
+}
+
+func (p *NodePatcher) patch(ctx context.Context, nodes typedcorev1.NodeInterface, nodeName string,
+	cached *v1.Node, mutate func(*v1.Node) error, guarded bool) (bool, error) {
 	var current *v1.Node
 
 	err := RetryNodePatch(func() error {
@@ -73,7 +90,7 @@ func (p *NodePatcher) Patch(
 			return fmt.Errorf("mutate node %q: %w", nodeName, err)
 		}
 
-		patch, err := NodeMergePatch(current, desired)
+		patch, err := nodeMergePatch(current, desired, guarded)
 		if err != nil {
 			return fmt.Errorf("build merge patch for node %q: %w", nodeName, err)
 		}
@@ -199,12 +216,18 @@ func IsRetryableNodePatchError(err error) bool {
 // Taints are emitted only when the caller changed them. A projected Node whose Spec
 // is empty on both sides therefore cannot erase taints from the real object.
 func NodeMergePatch(original, modified *v1.Node) ([]byte, error) {
+	return nodeMergePatch(original, modified, false)
+}
+
+func nodeMergePatch(original, modified *v1.Node, guarded bool) ([]byte, error) {
 	originalProjection := projectNodePatchableFields(original)
 	modifiedProjection := projectNodePatchableFields(modified)
 
 	specChanged := !reflect.DeepEqual(original.Spec.Taints, modified.Spec.Taints) ||
 		original.Spec.Unschedulable != modified.Spec.Unschedulable
-	if specChanged {
+
+	metadataGuard := guardedMetadataChanged(guarded, originalProjection, modifiedProjection)
+	if specChanged || metadataGuard {
 		// Lists in spec, such as taints, are replaced wholesale. ResourceVersion
 		// prevents a stale list from overwriting a concurrent update.
 		modifiedProjection.ResourceVersion = original.ResourceVersion
@@ -237,6 +260,10 @@ func NodeMergePatch(original, modified *v1.Node) ([]byte, error) {
 	}
 
 	return patch, nil
+}
+
+func guardedMetadataChanged(guarded bool, original, modified *v1.Node) bool {
+	return guarded && !reflect.DeepEqual(original.ObjectMeta, modified.ObjectMeta)
 }
 
 // patchProjectionJSON marshals a projection, keeping the named metadata maps in

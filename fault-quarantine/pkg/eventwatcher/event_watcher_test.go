@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -753,31 +754,74 @@ func TestProcessEvent_LiveTransientFailureStillPersistsStatus(t *testing.T) {
 		"withholding partial status is recovery-only and must not change the established live path")
 }
 
-func TestRecoveryWaitingForRebootPreservesReplay(t *testing.T) {
-	doc := storedHealthEvent("recovery")
-	doc["healthevent"].(datastore.Event)["isHealthy"] = true
-	event := &clientEventStub{document: doc, eventID: "52", recordUUID: "recovery", token: []byte("token")}
-	stream := &changeStreamWatcherStub{}
-	db := &databaseClientStub{}
-	watcher := NewEventWatcher(stream, db, time.Minute, &objectIDStoreStub{})
-	process := func(result error) error {
-		events := make(chan client.Event, 1)
-		events <- event
-		close(events)
-		stream.events = events
-		watcher.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
-			status := model.UnQuarantined
-			return &status, result
+func TestRecoveryWaitingForRebootPersistsBeforeCheckpoint(t *testing.T) {
+	for _, writeFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(writeFails), func(t *testing.T) {
+			doc := storedHealthEvent("recovery")
+			doc["healthevent"].(datastore.Event)["isHealthy"] = true
+			events := make(chan client.Event, 2)
+			events <- &clientEventStub{document: doc, eventID: "52", recordUUID: "recovery"}
+			events <- &clientEventStub{document: storedHealthEvent("fatal"), eventID: "53", recordUUID: "fatal"}
+			close(events)
+			var actions []string
+			stream := &changeStreamWatcherStub{events: events, actions: &actions}
+			db := &databaseClientStub{actions: &actions}
+			if writeFails {
+				db.completionErr = errors.New("store unavailable")
+			}
+			w := NewEventWatcher(stream, db, time.Minute, &objectIDStoreStub{})
+			w.SetProcessEventCallback(func(_ context.Context, event *model.HealthEventWithStatus) (*model.Status, error) {
+				if event.HealthEvent.IsHealthy {
+					return nil, common.ErrRebootValidationPending
+				}
+				status := model.Quarantined
+				return &status, nil
+			})
+			err := w.watchEvents(t.Context())
+			if writeFails {
+				require.ErrorIs(t, err, db.completionErr)
+				require.Zero(t, stream.markCalls)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []string{"complete", "checkpoint", "checkpoint"}, actions)
+			require.Equal(t, "awaitingReboot", db.completionValue)
+			require.Equal(t, "recovery", db.completionID)
+			require.Equal(t, "fatal", db.updatedID)
 		})
-		return watcher.watchEvents(t.Context())
 	}
-	require.ErrorIs(t, process(common.ErrRebootValidationPending), common.ErrRebootValidationPending)
-	require.Zero(t, db.updateCalls)
-	require.Zero(t, db.completionCalls)
-	require.Zero(t, stream.markCalls)
-	require.NoError(t, process(nil))
-	require.Equal(t, 1, db.updateCalls)
-	require.Equal(t, 1, stream.markCalls)
+}
+
+func TestRestartResumesDeferredHealthyWithoutNewLiveEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	rec := datastore.HealthEventWithStatus{CreatedAt: time.Now().Add(-48 * time.Hour), RawEvent: storedHealthEvent("old-healthy")}
+	rec.RawEvent["healthevent"].(datastore.Event)["isHealthy"] = true
+	store := &deferredRecoveryStore{record: rec}
+	db := &databaseClientStub{}
+	w := NewEventWatcher(&changeStreamWatcherStub{events: make(chan client.Event)}, db, time.Minute, &objectIDStoreStub{})
+	w.ConfigureRebootRecovery(true, store)
+	w.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+		cancel()
+		status := model.UnQuarantined
+		return &status, nil
+	})
+	require.NoError(t, w.watchEvents(ctx))
+	require.Equal(t, "old-healthy", db.updatedID)
+	require.Equal(t, 1, db.updateManyCalls)
+}
+
+type deferredRecoveryStore struct {
+	datastore.HealthEventStore
+	record datastore.HealthEventWithStatus
+}
+
+func (s *deferredRecoveryStore) FindHealthEventsByQueryBatched(_ context.Context, q datastore.QueryBuilder, _ int,
+	visit func([]datastore.HealthEventWithStatus) error) error {
+	if strings.Contains(fmt.Sprint(q.ToMongo()), coldstart.AwaitingRebootValue) {
+		return visit([]datastore.HealthEventWithStatus{s.record})
+	}
+	return nil
 }
 
 func TestWatchEvents_RecheckFailurePreservesReplay(t *testing.T) {

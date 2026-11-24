@@ -363,8 +363,14 @@ func (r *ValidationRequestReconciler) failedReleaseCriterion(ctx context.Context
 		return "validated-boot", nil
 	}
 
-	if _, bound := request.Annotations[annotation.ValidationBootID]; bound && !requiredTestsPassed(request, node.Name) {
-		return "required-test-passed", nil
+	if _, bound := request.Annotations[annotation.ValidationBootID]; bound {
+		if !annotation.IsEmptyValue(node.Annotations[annotation.QuarantineHealthEvent]) {
+			return "active-quarantine", nil
+		}
+
+		if !requiredTestsPassed(request, node.Name) {
+			return "required-test-passed", nil
+		}
 	}
 
 	return r.failedReadinessCriterion(ctx, node)
@@ -559,11 +565,26 @@ func releaseNodeFromSession(node *corev1.Node, validationRequestName string, sup
 		changed = true
 	}
 
+	if pending := node.Annotations[annotation.QuarantineValidationRequest]; pending != "" {
+		if !completesHandoff(pending, validationRequestName, entries) {
+			return changed, nil
+		}
+
+		delete(node.Annotations, annotation.QuarantineValidationRequest)
+
+		changed = true
+	}
+
 	if sessionBecameEmpty && applySchedulingGateRelease(node, schedulingGate) {
 		changed = true
 	}
 
 	return changed, nil
+}
+
+// Another request can finish before the boot-bound request registers its session entry.
+func completesHandoff(pending, name string, entries []sessionEntry) bool {
+	return pending == name && requestBootBound(entries, name)
 }
 
 func markNodeSessionEntryFailed(node *corev1.Node, validationRequestName string) (bool, error) {

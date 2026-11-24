@@ -164,6 +164,12 @@ func (c *ValidationClient) UpdateQuarantineValidationAnnotation(ctx context.Cont
 		}
 	}
 
+	if c.requireCompletedReboot && slices.ContainsFunc(events, func(old common.HealthEventWithTests) bool {
+		return old.GetId() == event.GetId()
+	}) {
+		return existingQuarantineValidationAnnotation, nil
+	}
+
 	events = append(events, common.HealthEventWithTests{HealthEvent: event, Tests: tests})
 	// Only keep the newest events up to a limit of maxQuarantineValidationHealthEvents
 	if len(events) > maxQuarantineValidationHealthEvents {
@@ -333,7 +339,34 @@ func (c *ValidationClient) CreateValidationRequest(ctx context.Context, node *co
 
 	validationObject.SetAnnotations(annotations)
 
-	return c.k8sClient.CreateValidationRequestResource(ctx, c.resourceGVR, validationObject)
+	err = c.k8sClient.CreateValidationRequestResource(ctx, c.resourceGVR, validationObject)
+	if err != nil {
+		return err
+	}
+
+	return c.recordHandoff(ctx, node, validationObject.GetName())
+}
+
+func (c *ValidationClient) recordHandoff(ctx context.Context, node *corev1.Node, name string) error {
+	if !c.requireCompletedReboot {
+		return nil
+	}
+
+	const key = common.QuarantineValidationHealthEventAnnotationKey
+	// Publish the handoff before the reconciler clears the active fault. A replay adopts the same request.
+	ctx = informer.WithNodeGuard(ctx, func(live *corev1.Node) error {
+		if live.UID != node.UID || live.Status.NodeInfo.BootID != node.Status.NodeInfo.BootID ||
+			live.Annotations[key] != node.Annotations[key] {
+			return fmt.Errorf("node %s changed before validation handoff", node.Name)
+		}
+
+		return nil
+	})
+
+	return c.k8sClient.UpdateNode(ctx, node.Name, func(live *corev1.Node) error {
+		live.Annotations[annotation.QuarantineValidationRequest] = name
+		return nil
+	})
 }
 
 func (c *ValidationClient) getTestsForHealthEvent(ctx context.Context, event *protos.HealthEvent) []string {

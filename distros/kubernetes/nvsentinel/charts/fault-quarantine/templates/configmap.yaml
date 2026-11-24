@@ -21,6 +21,7 @@ metadata:
     argocd.argoproj.io/sync-wave: "-1"
 data:
   config.toml: |
+    holdContactSupport = {{ .Values.holdContactSupport | default false }}
     label-prefix = {{ .Values.labelPrefix | quote }}
     {{- if include "fault-quarantine.gpuRecheckEnabled" . }}
     {{- if ne (int .Values.replicaCount) 1 }}

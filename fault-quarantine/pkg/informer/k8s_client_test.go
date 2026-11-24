@@ -17,6 +17,7 @@ package informer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -360,6 +361,36 @@ func TestQuarantineNodeAndSetAnnotationsMergesAppliedLabelWinners(t *testing.T) 
 		{Key: "gpu-fault", Value: "critical", Priority: 10, Order: 0},
 		{Key: "network-fault", Value: "active", Priority: 5, Order: 1},
 	}, applied)
+}
+
+func TestGuardedMetadataPatchRechecksConcurrentRelease(t *testing.T) {
+	ctx := t.Context()
+	node := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "guarded-refault"}, Spec: v1.NodeSpec{Unschedulable: true}}
+	nodes := testClient.CoreV1().Nodes()
+	_, err := nodes.Create(ctx, node, metav1.CreateOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = nodes.Delete(context.Background(), node.Name, metav1.DeleteOptions{}) })
+	c := &FaultQuarantineClient{Clientset: testClient}
+	released := errors.New("cordon released")
+	ctx = WithNodeGuard(ctx, func(live *v1.Node) error {
+		if !live.Spec.Unschedulable {
+			return released
+		}
+		return nil
+	})
+	err = c.UpdateNode(ctx, node.Name, func(current *v1.Node) error {
+		live, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		live.Spec.Unschedulable = false
+		_, err = nodes.Update(ctx, live, metav1.UpdateOptions{})
+		require.NoError(t, err)
+		current.Annotations = map[string]string{"new-fault": "true"}
+		return nil
+	})
+	require.ErrorIs(t, err, released)
+	live, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, live.Annotations["new-fault"])
 }
 
 func TestUnQuarantineNodeAndRemoveAnnotations(t *testing.T) {

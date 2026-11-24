@@ -15,6 +15,7 @@
 package annotation
 
 import (
+	"encoding/json"
 	"slices"
 
 	corev1 "k8s.io/api/core/v1"
@@ -23,6 +24,34 @@ import (
 
 // ValidationBootID identifies the boot on which a post-repair request must run and pass.
 const ValidationBootID = "nvsentinel.nvidia.com/validation-boot-id"
+
+// QuarantineValidationRequest names the boot-bound request holding this Node's scheduling gate.
+const QuarantineValidationRequest = "nvsentinel.nvidia.com/quarantine-validation-request"
+
+const ValidationSession = "nvsentinel.nvidia.com/validation-session"
+
+// QuarantineValidationOwner also recognizes boot-bound sessions started before the handoff annotation existed.
+func QuarantineValidationOwner(node *corev1.Node) string {
+	if name := node.Annotations[QuarantineValidationRequest]; name != "" {
+		return name
+	}
+
+	var entries []struct {
+		Name   string `json:"name"`
+		BootID string `json:"bootID"`
+	}
+	if raw := node.Annotations[ValidationSession]; raw != "" && json.Unmarshal([]byte(raw), &entries) == nil {
+		for _, entry := range entries {
+			if entry.BootID != "" && entry.Name != "" {
+				return entry.Name
+			}
+		}
+	}
+
+	return ""
+}
+
+const QuarantineHealthEvent = "quarantineHealthEvent"
 
 const RebootUID = "nvsentinel.nvidia.com/reboot-uid"
 const CordonPreExisting = "nvsentinel.nvidia.com/cordon-pre-existing"

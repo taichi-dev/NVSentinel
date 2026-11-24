@@ -650,6 +650,32 @@ var _ = Describe("Validation release readiness check", func() {
 		Entry("skipped", "skipped", true),
 	)
 
+	It("blocks boot-bound release when a fault arrives after tests", func() {
+		name := "refault-during-validation"
+		f := newReleaseFixture("refault", releaseFixtureOptions{}, name)
+		f.config.Validation.Spec.ReadinessCriteria = defaultTestConfig().Validation.Spec.ReadinessCriteria
+		node := getNode(ctx, name)
+		node.Status.NodeInfo.BootID = "boot-a"
+		Expect(k8sClient.Status().Update(ctx, &node)).To(Succeed())
+		var vr v1alpha1.ValidationRequest
+		Expect(k8sClient.Get(ctx, f.request.NamespacedName, &vr)).To(Succeed())
+		vr.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: name, UID: node.UID}}
+		vr.Spec.Tests = []string{"basic"}
+		vr.Annotations = map[string]string{"nvsentinel.nvidia.com/validation-boot-id": "boot-a"}
+		Expect(k8sClient.Update(ctx, &vr)).To(Succeed())
+		vr = f.running()
+		Expect(updateObjectStatusForAllTestGroups(ctx, &vr, testSuccessCondType)).To(Succeed())
+		fired := f.afterTestDeleted(func(context.Context) error {
+			node := getNode(ctx, name)
+			node.Annotations["quarantineHealthEvent"] = `[{"id":"new-fault"}]`
+			return k8sClient.Update(ctx, &node)
+		})
+		vr = f.reconcile()
+		Expect(*fired).To(BeTrue())
+		expectReleaseBlocked(vr, readinessViolation{node: name, criterion: "active-quarantine"})
+		expectGateRetained(name)
+	})
+
 	It("holds post-reboot validation before tests and checks the same boot during release", func() {
 		nodeName := "release-boot-change"
 		fixture := newReleaseFixture("boot-change", releaseFixtureOptions{}, nodeName)

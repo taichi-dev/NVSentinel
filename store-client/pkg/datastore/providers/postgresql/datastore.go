@@ -353,6 +353,8 @@ func buildConnectionString(conn datastore.ConnectionConfig) string {
 
 // createTables creates the necessary tables if they don't exist
 var recoveryIndexStatements = []string{
+	`CREATE INDEX IF NOT EXISTS idx_health_events_awaiting_reboot ON health_events (created_at,id) ` +
+		`WHERE document->'healtheventstatus'->>'faultquarantinerecovery' = 'awaitingReboot'`,
 	`CREATE INDEX IF NOT EXISTS idx_health_events_recovery_identity ON health_events (` +
 		`(document->'healthevent'->>'agent'), ` +
 		`(COALESCE(document->'healthevent'->>'componentclass', ` +

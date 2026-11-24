@@ -8661,6 +8661,82 @@ func TestBreakerAllowsRecoveryBehindBlockedIsolation(t *testing.T) {
 	}
 }
 
+func TestValidationCordonAcceptsRefaultAtCapacity(t *testing.T) {
+	ctx := t.Context()
+	var cfg config.TomlConfig
+	cfg.LabelPrefix = "k8s.nvidia.com/"
+	cfg.Validation = validationConfig([]config.ValidationRuleSet{{Enabled: true, Name: "repair", Version: "1",
+		Match: config.Match{Any: []config.Rule{{Kind: "HealthEvent", Expression: "event.isFatal == true"}}}, Tests: []string{"quick"}}})
+	cfg.Validation.RequireCompletedReboot = true
+	cfg.CircuitBreaker.AllowRecovery = true
+	for _, name := range []string{"at-cap", "validating", "external"} {
+		var annotations map[string]string
+		if name == "validating" {
+			annotations = map[string]string{"nvsentinel.nvidia.com/quarantine-validation-request": "validation-a"}
+		}
+		createE2ETestNode(ctx, t, name, annotations, nil, nil, name != "at-cap")
+		t.Cleanup(func() { _ = e2eTestClient.CoreV1().Nodes().Delete(context.Background(), name, metav1.DeleteOptions{}) })
+	}
+	_, w, status, cb := setupE2EReconciler(t, ctx, cfg, &breaker.CircuitBreakerConfig{Percentage: 1})
+	send := func(name string) string {
+		id := generateTestID()
+		data := createHealthEventBSON(id, name, "ecc", false, true, nil, model.StatusInProgress)
+		event := data["fullDocument"].(datastore.Event)["healthevent"].(datastore.Event)
+		event["quarantineoverrides"] = datastore.Event{"force": true}
+		event["metadata"] = datastore.Event{"creator_id": "operator"}
+		w.EventsChan <- &TestEvent{Data: data}
+		return id
+	}
+	first := send("at-cap")
+	require.Eventually(t, func() bool { return status(first) != nil }, eventuallyTimeout, 10*time.Millisecond)
+	tripped, err := cb.IsTripped(ctx)
+	require.NoError(t, err)
+	require.True(t, tripped)
+	send("external")
+	fatal := send("validating")
+	require.Eventually(t, func() bool { return status(fatal) != nil }, 2*time.Second, 10*time.Millisecond)
+	require.Equal(t, model.Quarantined, *status(fatal))
+	repeat := send("validating")
+	require.Eventually(t, func() bool { return status(repeat) != nil }, 2*time.Second, 10*time.Millisecond)
+	for _, name := range []string{"validating", "external"} {
+		n, err := e2eTestClient.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Equal(t, name == "validating", strings.Contains(n.Annotations[common.QuarantineHealthEventAnnotationKey], fatal))
+		require.Equal(t, name == "validating", strings.Contains(n.Annotations[common.QuarantineValidationHealthEventAnnotationKey], repeat))
+		require.True(t, n.Spec.Unschedulable)
+	}
+}
+
+func TestContactSupportHoldSurvivesActionChange(t *testing.T) {
+	for _, hold := range []bool{true, false} {
+		t.Run(fmt.Sprint(hold), func(t *testing.T) {
+			ctx := t.Context()
+			name := fmt.Sprintf("support-hold-%t", hold)
+			createE2ETestNode(ctx, t, name, nil, nil, nil, false)
+			t.Cleanup(func() { _ = e2eTestClient.CoreV1().Nodes().Delete(context.Background(), name, metav1.DeleteOptions{}) })
+			var cfg config.TomlConfig
+			cfg.LabelPrefix = "k8s.nvidia.com/"
+			cfg.HoldContactSupport = hold
+			cfg.RuleSets = []config.QuarantineRuleSet{{Enabled: true, Name: "fatal", Version: "1",
+				Match:  config.Match{Any: []config.Rule{{Kind: "HealthEvent", Expression: "event.isFatal == true"}}},
+				Cordon: config.Cordon{ShouldCordon: true}}}
+			_, w, status, _ := setupE2EReconciler(t, ctx, cfg, nil)
+			for i, action := range []protos.RecommendedAction{protos.RecommendedAction_RESTART_BM,
+				protos.RecommendedAction_CONTACT_SUPPORT, protos.RecommendedAction_RESTART_BM, protos.RecommendedAction_NONE} {
+				id := generateTestID()
+				data := createHealthEventBSON(id, name, "ecc", i == 3, i != 3, nil, model.StatusInProgress)
+				data["fullDocument"].(datastore.Event)["healthevent"].(datastore.Event)["recommendedaction"] = int32(action)
+				w.EventsChan <- &TestEvent{Data: data}
+				require.Eventually(t, func() bool { return status(id) != nil }, 2*time.Second, 10*time.Millisecond)
+			}
+			n, err := e2eTestClient.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, hold, n.Spec.Unschedulable)
+			require.Equal(t, hold, n.Annotations[common.QuarantineHealthEventAnnotationKey] != "")
+		})
+	}
+}
+
 func TestValidationRequiresCurrentCompletedReboot(t *testing.T) {
 	ctx := t.Context()
 	const nodeName = "validate-reboot"
@@ -8745,6 +8821,9 @@ func TestValidationRequiresCurrentCompletedReboot(t *testing.T) {
 		require.NoError(t, err)
 		for _, item := range list.Items {
 			if len(item.GetOwnerReferences()) > 0 && item.GetOwnerReferences()[0].Name == nodeName {
+				handoff, err := nodes.Get(ctx, nodeName, metav1.GetOptions{})
+				require.NoError(t, err)
+				require.Equal(t, item.GetName(), handoff.Annotations["nvsentinel.nvidia.com/quarantine-validation-request"])
 				require.Equal(t, "boot-b", item.GetAnnotations()["nvsentinel.nvidia.com/validation-boot-id"])
 				check(t, true) // Replayed handoff adopts the identical request.
 				item.SetAnnotations(map[string]string{"nvsentinel.nvidia.com/validation-boot-id": "boot-a"})

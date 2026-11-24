@@ -108,9 +108,10 @@ type GPUHealthRecheck struct {
 }
 
 type TomlConfig struct {
-	GPUHealthRecheck GPUHealthRecheck    `toml:"gpuHealthRecheck"`
-	LabelPrefix      string              `toml:"label-prefix"`
-	CircuitBreaker   CircuitBreaker      `toml:"circuitBreaker"`
-	RuleSets         []QuarantineRuleSet `toml:"rule-sets"`
-	Validation       ValidationConfig    `toml:"validation"`
+	HoldContactSupport bool                `toml:"holdContactSupport"`
+	GPUHealthRecheck   GPUHealthRecheck    `toml:"gpuHealthRecheck"`
+	LabelPrefix        string              `toml:"label-prefix"`
+	CircuitBreaker     CircuitBreaker      `toml:"circuitBreaker"`
+	RuleSets           []QuarantineRuleSet `toml:"rule-sets"`
+	Validation         ValidationConfig    `toml:"validation"`
 }

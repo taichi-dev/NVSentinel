@@ -43,6 +43,7 @@ const (
 	// RecoveryCompletionValue is shared by all terminal decisions. The detailed
 	// result remains available through the cold-start metric label.
 	RecoveryCompletionValue = "completed"
+	AwaitingRebootValue     = "awaitingReboot"
 )
 
 type recoveryContextKey struct{}
@@ -164,6 +165,7 @@ func GetRecoveryNode(
 type ProcessResult string
 
 const (
+	ProcessResultDeferred   ProcessResult = "deferred"
 	ProcessResultProcessed  ProcessResult = "processed"
 	ProcessResultSkipped    ProcessResult = "skipped"
 	ProcessResultSuperseded ProcessResult = "superseded"
@@ -321,7 +323,7 @@ func (p *recoveryProgress) recoverEvents(
 	completions := make([]StoredEventCompletion, 0, len(events))
 
 	for i := range events {
-		completion, err := recoverStoredEvent(ctx, resolver, processor, events[i])
+		completion, err := recoverStoredEvent(ctx, resolver, processor, events[i], false)
 		if completion != nil {
 			completions = append(completions, *completion)
 		}
@@ -370,6 +372,7 @@ func recoverStoredEvent(
 	resolver *supersessionResolver,
 	processor EventProcessor,
 	event storedRecoveryEvent,
+	deferred bool,
 ) (*StoredEventCompletion, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -409,13 +412,47 @@ func recoverStoredEvent(
 		return nil, recordRecoveryFailure(fmt.Errorf("failed to recover stored event: %w", err))
 	}
 
-	if result == ProcessResultSkipped || result == ProcessResultInvalid {
+	if result.needsCompletion(deferred) {
 		return &StoredEventCompletion{DocumentID: documentID, Result: result}, nil
 	}
 
 	metrics.ColdStartEvents.WithLabelValues(string(result)).Inc()
 
 	return nil, nil
+}
+
+func (result ProcessResult) needsCompletion(deferred bool) bool {
+	return result == ProcessResultSkipped || result == ProcessResultInvalid ||
+		(deferred && result == ProcessResultProcessed)
+}
+
+// RetryRebootRecovery applies the usual supersession checks up to the current stream head.
+func RetryRebootRecovery(ctx context.Context, store datastore.HealthEventStore, processor EventProcessor,
+	record datastore.HealthEventWithStatus) error {
+	event := parseStoredRecoveryEvent(record)
+	if event.parseErr != nil || !event.parsed.HealthEvent.GetIsHealthy() || record.CreatedAt.IsZero() {
+		return fmt.Errorf("invalid deferred recovery in store")
+	}
+
+	status := event.parsed.HealthEventStatus.GetNodeQuarantined()
+	if status == string(model.AlreadyQuarantined) || status == string(model.UnQuarantined) {
+		// The status write succeeded before a crash or completion-write failure.
+		id, err := storedDocumentID(record.RawEvent)
+		if err != nil {
+			return err
+		}
+
+		return processor.CompleteStoredEvents(ctx, []StoredEventCompletion{{DocumentID: id, Result: ProcessResultProcessed}})
+	}
+
+	resolver := newSupersessionResolver(store, time.Time{})
+
+	completion, err := recoverStoredEvent(ctx, resolver, processor, event, true)
+	if err != nil || completion == nil {
+		return err
+	}
+
+	return processor.CompleteStoredEvents(ctx, []StoredEventCompletion{*completion})
 }
 
 func parseStoredRecoveryEvent(record datastore.HealthEventWithStatus) storedRecoveryEvent {

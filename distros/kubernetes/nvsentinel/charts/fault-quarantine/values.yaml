@@ -49,6 +49,9 @@ clientCertMountPath: /etc/ssl/client-certs
 # These labels track the quarantine/uncordon lifecycle and help with debugging and auditing
 labelPrefix: "k8saas.nvidia.com/"
 
+# Keep a matched CONTACT_SUPPORT quarantine until an operator clears it.
+holdContactSupport: false
+
 # Circuit breaker configuration to prevent cascading failures
 # The circuit breaker prevents quarantining too many GPU nodes in the cluster at once
 # If the percentage threshold is exceeded, the circuit breaker trips and new quarantine actions are blocked
