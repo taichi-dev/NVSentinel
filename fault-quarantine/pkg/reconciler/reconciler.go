@@ -244,7 +244,7 @@ func (r *Reconciler) Start(ctx context.Context) error {
 		r,              // Reconciler implements LastProcessedObjectIDStore interface
 	)
 
-	watcher.ConfigureRebootRecovery(r.config.TomlConfig.Validation.RequireCompletedReboot, ds.HealthEventStore())
+	watcher.ConfigureRebootRecovery(r.config.TomlConfig.WaitForReboot(), ds.HealthEventStore())
 	r.eventWatcher = watcher
 
 	r.SetupNodeInformerCallbacks()
@@ -768,6 +768,8 @@ func (r *Reconciler) handleEvent(
 			"node", event.HealthEvent.NodeName,
 			"checkName", event.HealthEvent.CheckName)
 
+		ctx = r.guardExternalQuarantine(ctx, event.HealthEvent, node)
+
 		return r.handleAlreadyQuarantinedNode(ctx, event.HealthEvent, ruleSetEvals, rulesetsConfig)
 	}
 
@@ -923,6 +925,10 @@ func (r *Reconciler) handleAlreadyQuarantinedNode(
 
 	// As when the first quarantine fails, write no status, so that cold start replays the event and applies it
 	// again. A replay is safe: the event is skipped where it is already tracked or its actions already applied.
+	if r.config.TomlConfig.RequireExternalRebootReceipt && event.IsHealthy && processingErr != nil {
+		return nil, errors.Join(common.ErrRebootValidationPending, eligibilityErr, processingErr)
+	}
+
 	if errors.Is(processingErr, errQuarantinedNodeNotUpdated) ||
 		errors.Is(processingErr, common.ErrRebootValidationPending) {
 		return nil, errors.Join(eligibilityErr, processingErr)
@@ -1610,7 +1616,7 @@ func (r *Reconciler) handleUnhealthyEventOnQuarantinedNode(
 
 	added := healthEventsAnnotationMap.AddOrUpdateEventFiltered(event, recoveryEffectFilter(ctx))
 
-	if added || r.holdForSupport(event) || r.config.TomlConfig.Validation.RequireCompletedReboot {
+	if added || r.holdForSupport(event) || r.config.TomlConfig.WaitForReboot() {
 		slog.InfoContext(ctx, "Added entity failures for check on node",
 			"checkName", event.CheckName, "node", event.NodeName, "totalTrackedEntities", healthEventsAnnotationMap.Count())
 
@@ -2106,7 +2112,7 @@ func (r *Reconciler) addEventToAnnotation(
 		added := healthEventsMap.AddOrUpdateEventFiltered(event, recoveryEffectFilter(ctx))
 		if !added {
 			// A distinct fatal document can invalidate the maintenance receipt even for the same GPU and action.
-			if r.config.TomlConfig.Validation.RequireCompletedReboot {
+			if r.config.TomlConfig.WaitForReboot() {
 				return r.updateValidationAnnotation(ctx, node.Annotations, event)
 			}
 
@@ -2276,6 +2282,8 @@ func (r *Reconciler) performUncordon(
 		return false, nil
 	}
 
+	ctx = r.guardExternalReceipt(ctx)
+
 	annotationsToBeRemoved, taintsToBeRemoved, isUnCordon, validationRequestCreated, err :=
 		r.triggerValidationOnUnquarantine(ctx, span, event, annotations, annotationsToBeRemoved, taintsToBeRemoved,
 			isUnCordon)
@@ -2320,6 +2328,42 @@ func (r *Reconciler) performUncordon(
 	return false, nil
 }
 
+// A healthy event must not clear a newer fault, including another report for the same GPU.
+func (r *Reconciler) guardExternalQuarantine(ctx context.Context, event *protos.HealthEvent,
+	snapshot *corev1.Node) context.Context {
+	if !event.IsHealthy || !r.config.TomlConfig.RequireExternalRebootReceipt {
+		return ctx
+	}
+
+	return informer.WithNodeGuard(ctx, func(node *corev1.Node) error {
+		if node.UID != snapshot.UID {
+			return fmt.Errorf("%w: node %s was replaced", common.ErrRebootValidationPending, node.Name)
+		}
+
+		for _, key := range common.QuarantineAnnotationKeys {
+			if snapshot.Annotations[key] != node.Annotations[key] {
+				return fmt.Errorf("%w: quarantine changed on node %s", common.ErrRebootValidationPending, node.Name)
+			}
+		}
+
+		return nil
+	})
+}
+
+func (r *Reconciler) guardExternalReceipt(ctx context.Context) context.Context {
+	if !r.config.TomlConfig.RequireExternalRebootReceipt {
+		return ctx
+	}
+
+	return informer.WithNodeGuard(ctx, func(node *corev1.Node) error {
+		if err := r.validationClient.CheckExternalRebootReceipt(ctx, node); err != nil {
+			return errors.Join(common.ErrRebootValidationPending, err)
+		}
+
+		return nil
+	})
+}
+
 func (r *Reconciler) buildUncordonLabelsToRemove(ruleLabelsToRemove []config.Label,
 	validationRequestCreated bool) []string {
 	labelsToRemove := []string{statemanager.NVSentinelStateLabelKey}
@@ -2348,6 +2392,11 @@ func (r *Reconciler) triggerValidationOnUnquarantine(ctx context.Context, span t
 	isUnCordon bool) ([]string, []config.Taint, bool, bool, error) {
 	if _, exists := annotations[common.QuarantineValidationHealthEventAnnotationKey]; !exists {
 		return annotationsToBeRemoved, taintsToBeRemoved, isUnCordon, false, nil
+	}
+
+	if r.config.TomlConfig.RequireExternalRebootReceipt {
+		return append(annotationsToBeRemoved, common.QuarantineValidationHealthEventAnnotationKey),
+			taintsToBeRemoved, isUnCordon, false, nil
 	}
 
 	validationRequestCreated, err := r.createValidationRequestIfRequested(ctx, event, annotations)
@@ -2550,7 +2599,7 @@ func (r *Reconciler) getNodeQuarantineAnnotations(ctx context.Context, nodeName 
 // getNode bypasses the informer during recovery so reconciliation uses current node state.
 // A node deleted before replay is a permanent event error.
 func (r *Reconciler) getNode(ctx context.Context, nodeName string) (*corev1.Node, error) {
-	if coldstart.IsRecoveryContext(ctx) || r.config.TomlConfig.Validation.RequireCompletedReboot ||
+	if coldstart.IsRecoveryContext(ctx) || r.config.TomlConfig.WaitForReboot() ||
 		r.config.TomlConfig.HoldContactSupport {
 		node, err := coldstart.GetRecoveryNode(ctx, nodeName, func() (*corev1.Node, error) {
 			return r.k8sClient.Clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})

@@ -14,6 +14,8 @@
 
 package config
 
+import "fmt"
+
 type Rule struct {
 	Kind       string `toml:"kind"`
 	Expression string `toml:"expression"`
@@ -108,10 +110,29 @@ type GPUHealthRecheck struct {
 }
 
 type TomlConfig struct {
-	HoldContactSupport bool                `toml:"holdContactSupport"`
-	GPUHealthRecheck   GPUHealthRecheck    `toml:"gpuHealthRecheck"`
-	LabelPrefix        string              `toml:"label-prefix"`
-	CircuitBreaker     CircuitBreaker      `toml:"circuitBreaker"`
-	RuleSets           []QuarantineRuleSet `toml:"rule-sets"`
-	Validation         ValidationConfig    `toml:"validation"`
+	RequireExternalRebootReceipt bool                `toml:"requireExternalRebootReceipt"`
+	HoldContactSupport           bool                `toml:"holdContactSupport"`
+	GPUHealthRecheck             GPUHealthRecheck    `toml:"gpuHealthRecheck"`
+	LabelPrefix                  string              `toml:"label-prefix"`
+	CircuitBreaker               CircuitBreaker      `toml:"circuitBreaker"`
+	RuleSets                     []QuarantineRuleSet `toml:"rule-sets"`
+	Validation                   ValidationConfig    `toml:"validation"`
+}
+
+// WaitForReboot enables durable recovery retries and tracking of distinct fault documents.
+func (c TomlConfig) WaitForReboot() bool {
+	return c.Validation.RequireCompletedReboot || c.RequireExternalRebootReceipt
+}
+
+// ValidateExternalRebootReceipt checks that the chart's opt-in and mounted TOML agree.
+func (c TomlConfig) ValidateExternalRebootReceipt(required bool) error {
+	if c.RequireExternalRebootReceipt != required {
+		return fmt.Errorf("--require-external-reboot-receipt and requireExternalRebootReceipt must agree")
+	}
+
+	if required && (!c.HoldContactSupport || c.Validation.Enabled) {
+		return fmt.Errorf("external reboot receipts require holdContactSupport=true and validation.enabled=false")
+	}
+
+	return nil
 }

@@ -90,6 +90,9 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           args:
+          {{- if .Values.requireExternalRebootReceipt }}
+          - "--require-external-reboot-receipt"
+          {{- end }}
           - "--metrics-port={{ ((.Values.global).metricsPort) | default 2112 }}"
           - "--dry-run={{ ((.Values.global).dryRun) | default false }}"
           {{- $certMountPath := include "nvsentinel.mongodb.certMountPath" . }}

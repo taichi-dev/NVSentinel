@@ -42,8 +42,7 @@ import (
 	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
 )
 
-// maxQuarantineValidationHealthEvents bounds how many entries the quarantineValidationHealthEvent annotation can
-// hold. When exceeded, the oldest entries are dropped.
+// Bound full event payloads in native validation. External receipts retain compact document IDs.
 const maxQuarantineValidationHealthEvents = 10
 
 const annotationCordonPreExisting = annotation.CordonPreExisting
@@ -58,6 +57,7 @@ type ValidationClient struct {
 	resourceTemplate *template.Template
 	resourceGVR      schema.GroupVersionResource
 
+	externalRebootReceipt  bool
 	partialDrainEnabled    bool
 	requireCompletedReboot bool
 }
@@ -72,6 +72,13 @@ type templateData struct {
 
 func NewValidationClient(cfg config.TomlConfig, k8sClient *informer.FaultQuarantineClient,
 	healthEventStore datastore.HealthEventStore) (*ValidationClient, error) {
+	if cfg.RequireExternalRebootReceipt {
+		return &ValidationClient{
+			k8sClient: k8sClient, healthEventStore: healthEventStore,
+			partialDrainEnabled: cfg.Validation.PartialDrainEnabled, externalRebootReceipt: true,
+		}, nil
+	}
+
 	if !cfg.Validation.Enabled || len(cfg.Validation.RuleSets) == 0 {
 		return nil, nil
 	}
@@ -153,7 +160,7 @@ as part of a single validation test.
 func (c *ValidationClient) UpdateQuarantineValidationAnnotation(ctx context.Context,
 	existingQuarantineValidationAnnotation string, event *protos.HealthEvent) (string, error) {
 	tests := c.getTestsForHealthEvent(ctx, event)
-	if len(tests) == 0 {
+	if len(tests) == 0 && !c.externalRebootReceipt {
 		return existingQuarantineValidationAnnotation, nil
 	}
 
@@ -164,14 +171,14 @@ func (c *ValidationClient) UpdateQuarantineValidationAnnotation(ctx context.Cont
 		}
 	}
 
-	if c.requireCompletedReboot && slices.ContainsFunc(events, func(old common.HealthEventWithTests) bool {
+	strict := c.requireCompletedReboot || c.externalRebootReceipt
+	if strict && slices.ContainsFunc(events, func(old common.HealthEventWithTests) bool {
 		return old.GetId() == event.GetId()
 	}) {
 		return existingQuarantineValidationAnnotation, nil
 	}
 
-	events = append(events, common.HealthEventWithTests{HealthEvent: event, Tests: tests})
-	events = c.retainValidationEvents(events)
+	events = c.appendValidationEvent(events, event, tests)
 
 	data, err := json.Marshal(events)
 	if err != nil {
@@ -181,8 +188,15 @@ func (c *ValidationClient) UpdateQuarantineValidationAnnotation(ctx context.Cont
 	return string(data), nil
 }
 
-// Keep the complete test set when older event payloads leave a strict session.
-func (c *ValidationClient) retainValidationEvents(events []common.HealthEventWithTests) []common.HealthEventWithTests {
+func (c *ValidationClient) appendValidationEvent(events []common.HealthEventWithTests, event *protos.HealthEvent,
+	tests []string) []common.HealthEventWithTests {
+	if c.externalRebootReceipt {
+		// All admitted IDs must remain checkable, including late replays with no native tests.
+		return append(events, common.HealthEventWithTests{HealthEvent: &protos.HealthEvent{Id: event.GetId()}})
+	}
+
+	// Keep the complete test set when older event payloads leave a strict native session.
+	events = append(events, common.HealthEventWithTests{HealthEvent: event, Tests: tests})
 	if len(events) < maxQuarantineValidationHealthEvents {
 		return events
 	}
@@ -290,11 +304,11 @@ func (c *ValidationClient) FetchValidationTestsFromQuarantineSession(ctx context
 
 func (c *ValidationClient) validationRequirements(entries []common.HealthEventWithTests) (tests, ids []string) {
 	for _, entry := range entries {
-		if entry.HealthEvent == nil || len(entry.Tests) == 0 {
+		if !c.externalRebootReceipt && (entry.HealthEvent == nil || len(entry.Tests) == 0) {
 			continue
 		}
 
-		ids = append(ids, entry.Id)
+		ids = append(ids, entry.GetId())
 
 		tests = append(tests, entry.Tests...)
 		if c.requireCompletedReboot {

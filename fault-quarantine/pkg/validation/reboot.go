@@ -43,8 +43,22 @@ type restartMaintenance struct {
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
+var rebootNodeGVR = schema.GroupVersionResource{
+	Group: "janitor.dgxc.nvidia.com", Version: "v1alpha1", Resource: "rebootnodes",
+}
+
 // The restart group uses the maintenance creation time to decide which equivalent events it covers.
 func (c *ValidationClient) completedSessionReboot(ctx context.Context, node *corev1.Node,
+	session string, requestedTests []string) (string, error) {
+	name, err := c.sessionRestart(ctx, node, session, requestedTests)
+	if err != nil {
+		return "", err
+	}
+
+	return c.completedRebootUID(ctx, node, name)
+}
+
+func (c *ValidationClient) sessionRestart(ctx context.Context, node *corev1.Node,
 	session string, requestedTests []string) (string, error) {
 	var state struct {
 		EquivalenceGroups map[string]restartMaintenance `json:"equivalenceGroups"`
@@ -63,15 +77,17 @@ func (c *ValidationClient) completedSessionReboot(ctx context.Context, node *cor
 	}
 
 	tests, ids := c.validationRequirements(events)
-	if len(ids) == 0 || session != validationSessionID(ids) || !slices.Equal(requestedTests, tests) {
+	if len(ids) == 0 || ids[0] == "" || (!c.externalRebootReceipt &&
+		(session != validationSessionID(ids) || !slices.Equal(requestedTests, tests))) {
 		return "", fmt.Errorf("validation session changed on node %s", node.Name)
 	}
 
-	if err := c.verifyRestartDrain(ctx, node.Name, restart, ids, c.knownOverflowTests(events, ids, tests)); err != nil {
+	allowEvicted := !c.externalRebootReceipt && c.knownOverflowTests(events, ids, tests)
+	if err := c.verifyRestartDrain(ctx, node.Name, restart, ids, allowEvicted); err != nil {
 		return "", err
 	}
 
-	return c.completedRebootUID(ctx, node, restart.MaintenanceCR)
+	return restart.MaintenanceCR, nil
 }
 
 // Older capped annotations have no test summary. Their retained tests suffice when they cover every enabled rule.
@@ -227,9 +243,7 @@ func (c *ValidationClient) verifyEvictedInitiator(ctx context.Context, node, id 
 
 // The generic provider stores its pre-reboot boot ID in the SignalSent condition.
 func (c *ValidationClient) completedRebootUID(ctx context.Context, node *corev1.Node, crName string) (string, error) {
-	gvr := schema.GroupVersionResource{Group: "janitor.dgxc.nvidia.com", Version: "v1alpha1", Resource: "rebootnodes"}
-
-	cr, err := c.k8sClient.DynamicClient.Resource(gvr).Get(ctx, crName, metav1.GetOptions{})
+	cr, err := c.k8sClient.DynamicClient.Resource(rebootNodeGVR).Get(ctx, crName, metav1.GetOptions{})
 	if err != nil {
 		return "", fmt.Errorf("read RebootNode %s: %w", crName, err)
 	}

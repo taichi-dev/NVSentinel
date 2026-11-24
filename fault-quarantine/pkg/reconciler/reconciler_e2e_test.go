@@ -9005,3 +9005,181 @@ func TestValidationRequiresCurrentCompletedReboot(t *testing.T) {
 		t.Fatal("missing validation request")
 	})
 }
+
+func TestExternalRebootReceiptRecovery(t *testing.T) {
+	ctx := t.Context()
+	const name = "external-gpu-receipt"
+	const fault = "first-fault"
+	const request = "maintenance-" + name + "-" + fault
+	const prefix = "gpu-node-rebooter.meshy.ai/"
+	const repair = "nvsentinel.meshy.ai/gpu-fault"
+	created := time.Now().UTC()
+	nodes := e2eTestClient.CoreV1().Nodes()
+	foreign := corev1.Taint{Key: "example.org/maintenance", Value: "other", Effect: corev1.TaintEffectNoSchedule}
+	createE2ETestNode(ctx, t, name, nil, nil, []corev1.Taint{foreign}, false)
+	t.Cleanup(func() { _ = nodes.Delete(context.Background(), name, metav1.DeleteOptions{}) })
+	get := func() *corev1.Node {
+		n, err := nodes.Get(ctx, name, metav1.GetOptions{})
+		require.NoError(t, err)
+		return n
+	}
+	var onRead func()
+	var lateFault string
+	drainStatus := datastore.StatusSucceeded
+	store := &mockHealthEventStore{findLatestHealthEventByQueryFn: func(_ context.Context, b datastore.QueryBuilder) (*datastore.HealthEventWithStatus, error) {
+		if onRead != nil {
+			f := onRead
+			onRead = nil
+			f()
+		}
+		sql, args := b.ToSQL()
+		require.Equal(t, "id = $1", sql)
+		id := args[0].(string)
+		ts := created.Add(-time.Minute)
+		if id == "new-fault" || id == "second-fault" || id == lateFault {
+			ts = created.Add(time.Minute)
+		}
+		health := &protos.HealthEvent{Id: id, NodeName: name}
+		state := datastore.HealthEventStatus{UserPodsEvictionStatus: datastore.OperationStatus{Status: drainStatus}}
+		return &datastore.HealthEventWithStatus{CreatedAt: ts, HealthEventStatus: state,
+			RawEvent: datastore.Event{"healthevent": health, "healtheventstatus": state}}, nil
+	}}
+	cfg := config.TomlConfig{RequireExternalRebootReceipt: true, HoldContactSupport: true, LabelPrefix: "nvsentinel.meshy.ai/"}
+	taint := config.Taint{Key: repair, Value: "true", Effect: "NoSchedule"}
+	cfg.RuleSets = []config.QuarantineRuleSet{{Enabled: true, Name: "fatal", Version: "1",
+		Match: config.Match{Any: []config.Rule{{Kind: "HealthEvent", Expression: "event.isFatal == true"}}}, Taint: taint}}
+	r, _, _, _ := setupE2EReconcilerWithOptions(t, ctx, E2EReconcilerConfig{TomlConfig: cfg, HealthEventStore: store})
+	rules, err := evaluator.InitializeRuleSetEvaluators(quarantineRuleSetMetas(cfg.RuleSets), r.k8sClient.NodeInformer)
+	require.NoError(t, err)
+	process := func(id string, healthy bool) (*model.Status, error) {
+		event := &protos.HealthEvent{Id: id, NodeName: name, Agent: "syslog", CheckName: "Xid", IsHealthy: healthy, IsFatal: !healthy, RecommendedAction: protos.RecommendedAction_RESTART_BM}
+		return r.ProcessEvent(ctx, &model.HealthEventWithStatus{HealthEvent: event}, rules, rulesetsConfig{TaintConfigMap: map[string]*config.Taint{"fatal": &taint}})
+	}
+	status, err := process(fault, false)
+	require.NoError(t, err)
+	require.Equal(t, model.Quarantined, *status)
+	pending := func(t *testing.T) {
+		t.Helper()
+		status, err := process("healthy", true)
+		require.ErrorIs(t, err, common.ErrRebootValidationPending)
+		require.Nil(t, status)
+		n := get()
+		require.Contains(t, n.Spec.Taints, corev1.Taint{Key: repair, Value: "true", Effect: corev1.TaintEffectNoSchedule})
+		require.NotEmpty(t, n.Annotations[common.QuarantineHealthEventAnnotationKey])
+	}
+	t.Run("healthy before RebootNode", pending)
+
+	api := e2eTestDynamicClient.Resource(schema.GroupVersionResource{Group: "janitor.dgxc.nvidia.com", Version: "v1alpha1", Resource: "rebootnodes"})
+	obj := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "janitor.dgxc.nvidia.com/v1alpha1", "kind": "RebootNode", "metadata": map[string]any{"name": request}, "spec": map[string]any{"nodeName": name, "force": false}}}
+	node := get()
+	obj.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: name, UID: node.UID}})
+	obj.SetLabels(map[string]string{"app.kubernetes.io/managed-by": "nvsentinel", "meshy.ai/reboot-executor": "gpu-node-rebooter"})
+	cr, err := api.Create(ctx, obj, metav1.CreateOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = api.Delete(context.Background(), request, metav1.DeleteOptions{}) })
+	node.Annotations["latestFaultRemediationState"] = fmt.Sprintf(`{"equivalenceGroups":{"restart":{"maintenanceCR":%q,"createdAt":%q}}}`, request, created.Format(time.RFC3339Nano))
+	for k, v := range map[string]string{"phase": "returning", "session": "session1", "reboot-at": created.Format(time.RFC3339), "source-boot-id": "old", "verified-boot-id": "new",
+		"nvsentinel-requests": fmt.Sprintf(`[{"Name":%q,"UID":%q,"Node":%q}]`, request, cr.GetUID(), name)} {
+		node.Annotations[prefix+k] = v
+	}
+	node, err = nodes.Update(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	node.Status.NodeInfo.BootID = "new"
+	_, err = nodes.UpdateStatus(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	t.Run("missing receipt", pending)
+	condition := map[string]any{"type": "ForlesGPUValidated", "status": "True", "reason": "EightGPUsVerified", "lastTransitionTime": created.Format(time.RFC3339),
+		"observedGeneration": cr.GetGeneration(), "message": fmt.Sprintf(`{"requestUID":%q,"nodeUID":%q,"session":"session1","sourceBootID":"old","verifiedBootID":"new"}`, cr.GetUID(), node.UID)}
+	setConditions := func(conds ...any) {
+		cr.Object["status"] = map[string]any{"conditions": conds}
+		cr, err = api.UpdateStatus(ctx, cr, metav1.UpdateOptions{})
+		require.NoError(t, err)
+	}
+	setConditions(condition, map[string]any{"type": "NodeReady", "status": "False", "reason": "RepairFailed", "lastTransitionTime": created.Format(time.RFC3339), "message": "failed"})
+	t.Run("failed request with prior valid proof", pending)
+	setConditions(condition)
+	drainStatus = datastore.AlreadyDrained
+	t.Run("inherited drain", pending)
+	drainStatus = datastore.StatusSucceeded
+	t.Run("boot replaced after verification", func(t *testing.T) {
+		n := get()
+		n.Status.NodeInfo.BootID = "third"
+		n, err = nodes.UpdateStatus(ctx, n, metav1.UpdateOptions{})
+		require.NoError(t, err)
+		pending(t)
+		n.Status.NodeInfo.BootID = "new"
+		_, err = nodes.UpdateStatus(ctx, n, metav1.UpdateOptions{})
+		require.NoError(t, err)
+	})
+	t.Run("new fault during release", func(t *testing.T) {
+		key := common.QuarantineValidationHealthEventAnnotationKey
+		original := get().Annotations[key]
+		onRead = func() {
+			n := get()
+			n.Annotations[key] = strings.TrimSuffix(original, "]") + `,{"id":"new-fault","nodeName":"external-gpu-receipt"}]`
+			_, err := nodes.Update(ctx, n, metav1.UpdateOptions{})
+			require.NoError(t, err)
+		}
+		pending(t) // Optimistic Node patch must conflict and repeat the guard.
+		require.Nil(t, onRead)
+		pending(t) // A fresh retry must also reject the older receipt.
+		n := get()
+		n.Annotations[key] = original
+		_, err := nodes.Update(ctx, n, metav1.UpdateOptions{})
+		require.NoError(t, err)
+	})
+	t.Run("same check refault after maintenance", func(t *testing.T) {
+		key := common.QuarantineValidationHealthEventAnnotationKey
+		original := get().Annotations[key]
+		status, err := process("second-fault", false)
+		require.NoError(t, err)
+		require.Equal(t, model.AlreadyQuarantined, *status)
+		require.Contains(t, get().Annotations[key], "second-fault")
+		pending(t)
+		n := get()
+		n.Annotations[key] = original
+		_, err = nodes.Update(ctx, n, metav1.UpdateOptions{})
+		require.NoError(t, err)
+	})
+	t.Run("external receipt beyond ten testless faults", func(t *testing.T) {
+		for i := range 11 {
+			status, err := process(fmt.Sprintf("covered-%d", i), false)
+			require.NoError(t, err)
+			require.Equal(t, model.AlreadyQuarantined, *status)
+		}
+
+		n := get()
+		var saved []common.HealthEventWithTests
+		require.NoError(t, json.Unmarshal([]byte(n.Annotations[common.QuarantineValidationHealthEventAnnotationKey]), &saved))
+		require.Len(t, saved, 12)
+		require.Equal(t, fault, saved[0].GetId())
+		for _, entry := range saved {
+			require.Empty(t, entry.Tests)
+		}
+
+		// Both the initiator and this later replay are outside the newest ten.
+		lateFault = "covered-0"
+		pending(t)
+		lateFault = ""
+		require.NoError(t, r.validationClient.CheckExternalRebootReceipt(ctx, get()))
+		// A different session cannot borrow this receipt just because it has ten IDs.
+		other, err := json.Marshal(saved[2:])
+		require.NoError(t, err)
+		n.Annotations[common.QuarantineValidationHealthEventAnnotationKey] = string(other)
+		require.ErrorContains(t, r.validationClient.CheckExternalRebootReceipt(ctx, n), "complete validation history")
+	})
+	t.Run("validated before registration", func(t *testing.T) {
+		status, err := process("healthy", true)
+		require.NoError(t, err)
+		require.Equal(t, model.UnQuarantined, *status)
+		n := get()
+		require.Contains(t, n.Spec.Taints, foreign)
+		for _, taint := range n.Spec.Taints {
+			require.NotEqual(t, repair, taint.Key)
+		}
+		require.Empty(t, n.Annotations[common.QuarantineHealthEventAnnotationKey])
+		require.Empty(t, n.Annotations[common.QuarantineValidationHealthEventAnnotationKey])
+		require.Equal(t, "session1", n.Annotations[prefix+"session"])
+		require.Empty(t, listValidationRequestTests(ctx, t, name))
+	})
+}

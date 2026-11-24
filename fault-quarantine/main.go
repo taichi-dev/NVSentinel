@@ -79,6 +79,8 @@ func main() {
 }
 
 func run() error {
+	requireReceipt := flag.Bool("require-external-reboot-receipt", false,
+		"require the external reboot receipt gate in the mounted configuration")
 	metricsPort, databaseClientCertMountPath, kubeconfigPath, dryRun, circuitBreakerEnabled,
 		tomlConfigPath, gpuNodeLabelKey, gpuNodeLabelValue, rateLimits := parseFlags()
 
@@ -104,14 +106,15 @@ func run() error {
 	)
 
 	params := initializer.InitializationParams{
-		DatabaseClientCertMountPath: databaseClientCertMountPath,
-		KubeconfigPath:              *kubeconfigPath,
-		TomlConfigPath:              *tomlConfigPath,
-		DryRun:                      *dryRun,
-		CircuitBreakerEnabled:       *circuitBreakerEnabled,
-		GPUNodeLabelKey:             *gpuNodeLabelKey,
-		GPUNodeLabelValue:           *gpuNodeLabelValue,
-		KubernetesClientRateLimits:  *rateLimits,
+		DatabaseClientCertMountPath:  databaseClientCertMountPath,
+		KubeconfigPath:               *kubeconfigPath,
+		TomlConfigPath:               *tomlConfigPath,
+		RequireExternalRebootReceipt: *requireReceipt,
+		DryRun:                       *dryRun,
+		CircuitBreakerEnabled:        *circuitBreakerEnabled,
+		GPUNodeLabelKey:              *gpuNodeLabelKey,
+		GPUNodeLabelValue:            *gpuNodeLabelValue,
+		KubernetesClientRateLimits:   *rateLimits,
 	}
 
 	components, err := initializer.InitializeAll(ctx, params)

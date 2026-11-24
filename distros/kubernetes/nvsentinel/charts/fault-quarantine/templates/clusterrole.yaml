@@ -46,8 +46,10 @@ rules:
   - create
 {{- if .Values.validation.requireCompletedReboot }}
   - get
+{{- end }}
+{{- end }}
+{{- if or .Values.requireExternalRebootReceipt (and .Values.validation.enabled .Values.validation.requireCompletedReboot) }}
 - apiGroups: ["janitor.dgxc.nvidia.com"]
   resources: ["rebootnodes"]
   verbs: ["get"]
-{{- end }}
 {{- end }}
