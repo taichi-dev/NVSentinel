@@ -201,6 +201,7 @@ type EventProcessor interface {
 }
 
 type Dependencies struct {
+	HoldContactSupport bool
 	HealthEventStore   datastore.HealthEventStore
 	EventProcessor     EventProcessor
 	ColdStartAfterTime time.Time
@@ -249,6 +250,7 @@ func Handle(ctx context.Context, deps Dependencies) error {
 	}
 
 	resolver := newSupersessionResolver(deps.HealthEventStore, deps.ColdStartUntilTime)
+	resolver.holdContactSupport = deps.HoldContactSupport
 	progress := &recoveryProgress{}
 
 	recoveryQuery := coldStartQuery(deps.ColdStartAfterTime, deps.ColdStartUntilTime)

@@ -1063,6 +1063,72 @@ func TestE2E_ColdStartSkipsFailureSupersededByRecovery(t *testing.T) {
 	assert.Equal(t, 2, dbClient.callCount(), "fault and healthy phases persist terminal decisions separately")
 }
 
+func TestColdStartUnseenContactSupportThenHealthy(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		hold, matching, tripped, wantHeld bool
+	}{
+		{"enabled", true, true, false, true},
+		{"disabled", false, true, false, false},
+		{"unmatched", true, false, false, false},
+		{"at-capacity", true, true, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			name := "replay-support-" + tc.name
+			createE2ETestNode(ctx, t, name, nil, nil, nil, false)
+			t.Cleanup(func() { _ = e2eTestClient.CoreV1().Nodes().Delete(context.Background(), name, metav1.DeleteOptions{}) })
+			cfg := coldStartTestConfig()
+			cfg.HoldContactSupport = tc.hold
+			cfg.CircuitBreaker.AllowRecovery = true
+			var breakerCfg *breaker.CircuitBreakerConfig
+			if tc.tripped {
+				breakerCfg = &breaker.CircuitBreakerConfig{Percentage: 1}
+			}
+			r, _, _, cb := setupE2EReconciler(t, ctx, cfg, breakerCfg)
+			if tc.tripped {
+				require.NoError(t, cb.ForceState(ctx, breaker.StateTripped))
+			}
+			db := &coldStartDatabaseClient{statuses: make(map[string]string)}
+			w := &coldStartCallbackWatcherStub{EventWatcherInterface: newColdStartEventProcessor(t, r, db)}
+			r.SetEventWatcher(w)
+			fault := directStoredHealthEvent("support", name, "GpuNvlinkWatch", false, tc.matching)
+			fault["healthevent"].(datastore.Event)["recommendedaction"] = int32(protos.RecommendedAction_CONTACT_SUPPORT)
+			healthy := directStoredHealthEvent("recovery", name, "GpuNvlinkWatch", true, false)
+			now := time.Now()
+			store := &coldStartHealthEventStore{findBatched: func(_ context.Context, q datastore.QueryBuilder, _ int,
+				visit func([]datastore.HealthEventWithStatus) error) error {
+				records := []datastore.HealthEventWithStatus{{RawEvent: fault, CreatedAt: now.Add(-time.Second)}, {RawEvent: healthy, CreatedAt: now}}
+				if strings.Contains(fmt.Sprint(q.ToMongo()), coldstart.RecoveryCompletionStatusPath) {
+					records = slices.DeleteFunc(records, func(record datastore.HealthEventWithStatus) bool {
+						id := fmt.Sprint(record.RawEvent["_id"])
+						return db.completion(id) != "" || db.status(id) != ""
+					})
+				}
+				return visit(records)
+			}}
+			r.configureColdStart(ctx, false, false, now.Add(-time.Hour), store)
+			require.NoError(t, w.callback(ctx))
+			node, err := e2eTestClient.CoreV1().Nodes().Get(ctx, name, metav1.GetOptions{})
+			require.NoError(t, err)
+			require.Equal(t, tc.wantHeld, node.Spec.Unschedulable)
+			require.Equal(t, tc.wantHeld, node.Annotations[common.ContactSupportHold] == "true")
+			if tc.wantHeld {
+				require.Equal(t, string(model.Quarantined), db.status("support"))
+				require.Equal(t, string(model.AlreadyQuarantined), db.status("recovery"))
+			} else {
+				require.Equal(t, coldstart.RecoveryCompletionValue, db.completion("support"))
+			}
+			if tc.tripped {
+				calls := db.callCount()
+				require.NoError(t, cb.ForceState(ctx, breaker.StateClosed))
+				require.NoError(t, w.callback(ctx))
+				require.Equal(t, calls, db.callCount(), "resetting the breaker must not replay a terminal admission decision")
+			}
+		})
+	}
+}
+
 func TestE2E_ColdStartCompletesEventForDeletedNode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(e2eTestContext, 20*time.Second)
 	defer cancel()
@@ -1138,6 +1204,7 @@ func TestE2E_BasicQuarantineAndUnquarantine(t *testing.T) {
 	beforeQuarantined := getCounterVecValue(t, metrics.TotalNodesQuarantined, nodeName)
 	beforeTaints := getCounterVecValue(t, metrics.TaintsApplied, "nvidia.com/gpu-xid-error", "NoSchedule")
 	beforeLabels := getCounterVecValue(t, metrics.LabelsApplied, "nvidia.com/gpu-fault")
+	beforeLabelsRemoved := getCounterVecValue(t, metrics.LabelsRemoved, "nvidia.com/gpu-fault")
 	beforeCordons := getCounterValue(t, metrics.CordonsApplied)
 	beforeCordonsRemoved := getCounterValue(t, metrics.CordonsRemoved)
 	beforeRulesetPassed := getCounterVecValue(t, metrics.RulesetEvaluations, "gpu-xid-critical-errors", metrics.StatusPassed)
@@ -1253,7 +1320,7 @@ func TestE2E_BasicQuarantineAndUnquarantine(t *testing.T) {
 	assert.GreaterOrEqual(t, afterUnquarantined, beforeQuarantined+1, "TotalNodesUnquarantined should increment")
 	assert.Equal(t, float64(0), finalGauge, "CurrentQuarantinedNodes should be 0 after unquarantine")
 	assert.GreaterOrEqual(t, afterTaintsRemoved, beforeTaints+1, "TaintsRemoved should increment")
-	assert.GreaterOrEqual(t, afterLabelsRemoved, beforeLabels+1, "LabelsRemoved should increment")
+	assert.GreaterOrEqual(t, afterLabelsRemoved, beforeLabelsRemoved+1, "LabelsRemoved should increment")
 	assert.GreaterOrEqual(t, afterCordonsRemoved, beforeCordonsRemoved+1, "CordonsRemoved should increment")
 	assert.GreaterOrEqual(t, finalProcessed, beforeProcessed+2, "TotalEventsSuccessfullyProcessed should increment for both events")
 }
@@ -8756,14 +8823,45 @@ func TestValidationRequiresCurrentCompletedReboot(t *testing.T) {
 	node, err = nodes.UpdateStatus(ctx, node, metav1.UpdateOptions{})
 	require.NoError(t, err)
 	drainStatus := datastore.StatusSucceeded
-	store := &mockHealthEventStore{findHealthEventsByQueryFn: func(_ context.Context, b datastore.QueryBuilder) ([]datastore.HealthEventWithStatus, error) {
-		_, args := b.ToSQL()
+	receiptNode := nodeName
+	receiptAvailable := true
+	quarantined := datastore.Quarantined
+	var lookups []string
+	var intervening *datastore.HealthEventWithStatus
+	var historyErr error
+	store := &mockHealthEventStore{findLatestHealthEventByQueryFn: func(_ context.Context, q datastore.QueryBuilder) (*datastore.HealthEventWithStatus, error) {
+		sql, args := q.ToSQL()
+		if sql != "id = $1" {
+			require.Contains(t, sql, "id !=")
+			require.Contains(t, sql, "created_at >=")
+			require.Contains(t, args, eventID)
+			require.Contains(t, args, created)
+			filter := fmt.Sprint(q.ToMongo())
+			for _, term := range []string{"$gte", "$gt", "$ne", "healthevent.nodename", nodeName, "healtheventstatus.nodequarantined", "Quarantined", "UnQuarantined", "Cancelled", "createdAt"} {
+				require.Contains(t, filter, term)
+			}
+			return intervening, historyErr
+		}
 		id := args[0].(string)
-		eventTime := created.Add(-time.Minute)
-		if id != eventID {
+		lookups = append(lookups, id)
+		eventNode := nodeName
+		status := datastore.AlreadyQuarantined
+		eventTime := created.Add(-time.Second)
+		if id == eventID {
+			if !receiptAvailable {
+				return nil, nil
+			}
+			eventNode = receiptNode
+			status = quarantined
+			eventTime = created.Add(-time.Minute)
+		}
+		if id == "fault-b" {
 			eventTime = created.Add(time.Minute)
 		}
-		return []datastore.HealthEventWithStatus{{CreatedAt: eventTime, HealthEvent: &protos.HealthEvent{Id: id, NodeName: nodeName}, HealthEventStatus: datastore.HealthEventStatus{UserPodsEvictionStatus: datastore.OperationStatus{Status: drainStatus}}}}, nil
+		health := &protos.HealthEvent{Id: id, NodeName: eventNode, IsFatal: true}
+		state := datastore.HealthEventStatus{NodeQuarantined: &status, UserPodsEvictionStatus: datastore.OperationStatus{Status: drainStatus}}
+		return &datastore.HealthEventWithStatus{CreatedAt: eventTime, HealthEvent: health, HealthEventStatus: state,
+			RawEvent: datastore.Event{"healthevent": health, "healtheventstatus": state}}, nil
 	}}
 	r, _, _, _ := setupE2EReconcilerWithOptions(t, ctx, E2EReconcilerConfig{TomlConfig: cfg, HealthEventStore: store})
 	event := &protos.HealthEvent{NodeName: nodeName, IsHealthy: true}
@@ -8814,6 +8912,76 @@ func TestValidationRequiresCurrentCompletedReboot(t *testing.T) {
 		defer setValidationEvents(original)
 		setValidationEvents(strings.TrimSuffix(original, "]") + `,{"id":"fault-b","nodeName":"validate-reboot","tests":["quick"]}]`)
 		check(t, false)
+	})
+	t.Run("receipt outside newest ten", func(t *testing.T) {
+		original := annotations[common.QuarantineValidationHealthEventAnnotationKey]
+		defer setValidationEvents(original)
+		// The initiating fault also required a test absent from the retained faults.
+		window := strings.Replace(original, `"quick"`, `"quick","extended"`, 1)
+		for i := range 10 {
+			var err error
+			window, err = r.validationClient.UpdateQuarantineValidationAnnotation(ctx, window, &protos.HealthEvent{
+				NodeName: nodeName, Id: fmt.Sprintf("covered-%d", i), IsFatal: true,
+			})
+			require.NoError(t, err)
+		}
+		require.NotContains(t, window, eventID)
+		var saved []common.HealthEventWithTests
+		require.NoError(t, json.Unmarshal([]byte(window), &saved))
+		require.Len(t, saved, 10)
+		require.ElementsMatch(t, []string{"extended", "quick"}, saved[0].SessionTests)
+		setValidationEvents(window)
+		saved[0].SessionTests = nil
+		legacy, err := json.Marshal(saved)
+		require.NoError(t, err)
+		setValidationEvents(string(legacy))
+		newConfig := cfg
+		newConfig.Validation.RuleSets = slices.Clone(cfg.Validation.RuleSets)
+		extra := cfg.Validation.RuleSets[0]
+		extra.Name = "extended-on-other-fault"
+		extra.Tests = []string{"extended"}
+		newConfig.Validation.RuleSets = append(newConfig.Validation.RuleSets, extra)
+		uniform := r.validationClient
+		r.validationClient, err = validation.NewValidationClient(newConfig, r.k8sClient, store)
+		require.NoError(t, err)
+		check(t, false)
+		r.validationClient = uniform
+		// A legacy window covering the entire active policy reaches the history check.
+		intervening = &datastore.HealthEventWithStatus{}
+		_, err = r.createValidationRequestIfRequested(ctx, event, annotations)
+		require.ErrorContains(t, err, "does not cover the current quarantine")
+		intervening = nil
+		setValidationEvents(window)
+		receiptAvailable = false
+		check(t, false)
+		receiptAvailable = true
+		receiptNode = "different-node"
+		check(t, false)
+		receiptNode = nodeName
+		quarantined = datastore.StatusNotStarted
+		check(t, false)
+		quarantined = datastore.Quarantined
+		historyErr = fmt.Errorf("history unavailable")
+		check(t, false)
+		historyErr = nil
+		drainStatus = datastore.AlreadyDrained
+		check(t, false)
+		drainStatus = datastore.StatusSucceeded
+		intervening = &datastore.HealthEventWithStatus{CreatedAt: created}
+		check(t, false)
+		intervening = nil
+		lookups = nil
+		check(t, true)
+		require.Len(t, lookups, 11)
+		require.Contains(t, lookups, eventID)
+		require.Equal(t, [][]string{{"extended", "quick"}}, listValidationRequestTests(ctx, t, nodeName))
+		list, err := e2eTestDynamicClient.Resource(validationRequestGVR).List(ctx, metav1.ListOptions{})
+		require.NoError(t, err)
+		for _, item := range list.Items {
+			if refs := item.GetOwnerReferences(); len(refs) > 0 && refs[0].UID == node.UID {
+				require.NoError(t, e2eTestDynamicClient.Resource(validationRequestGVR).Delete(ctx, item.GetName(), metav1.DeleteOptions{}))
+			}
+		}
 	})
 	t.Run("completed reboot", func(t *testing.T) {
 		check(t, true)

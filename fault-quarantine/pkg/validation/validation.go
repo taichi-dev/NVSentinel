@@ -171,10 +171,7 @@ func (c *ValidationClient) UpdateQuarantineValidationAnnotation(ctx context.Cont
 	}
 
 	events = append(events, common.HealthEventWithTests{HealthEvent: event, Tests: tests})
-	// Only keep the newest events up to a limit of maxQuarantineValidationHealthEvents
-	if len(events) > maxQuarantineValidationHealthEvents {
-		events = events[len(events)-maxQuarantineValidationHealthEvents:]
-	}
+	events = c.retainValidationEvents(events)
 
 	data, err := json.Marshal(events)
 	if err != nil {
@@ -182,6 +179,28 @@ func (c *ValidationClient) UpdateQuarantineValidationAnnotation(ctx context.Cont
 	}
 
 	return string(data), nil
+}
+
+// Keep the complete test set when older event payloads leave a strict session.
+func (c *ValidationClient) retainValidationEvents(events []common.HealthEventWithTests) []common.HealthEventWithTests {
+	if len(events) < maxQuarantineValidationHealthEvents {
+		return events
+	}
+
+	first := max(0, len(events)-maxQuarantineValidationHealthEvents)
+
+	window := events[first:]
+	if c.requireCompletedReboot && (first == 0 || len(events[0].SessionTests) > 0) {
+		tests := slices.Clone(events[0].SessionTests)
+		for _, event := range events {
+			tests = append(tests, event.Tests...)
+		}
+
+		sort.Strings(tests)
+		window[0].SessionTests = slices.Compact(tests)
+	}
+
+	return window
 }
 
 /*
@@ -245,27 +264,15 @@ func (c *ValidationClient) FetchValidationTestsFromQuarantineSession(ctx context
 		return nil, "", fmt.Errorf("failed to parse validation annotation for node %s: %w", nodeName, err)
 	}
 
-	events := make([]*protos.HealthEvent, 0, len(eventsWithTests))
-
-	var tests, eventIDs []string
-
-	for _, event := range eventsWithTests {
-		if event.HealthEvent == nil {
-			continue
-		}
-
-		events = append(events, event.HealthEvent)
-
-		if len(event.Tests) == 0 {
-			continue
-		}
-
-		eventIDs = append(eventIDs, event.Id)
-
-		tests = append(tests, event.Tests...)
-	}
-
 	if !c.requireCompletedReboot {
+		var events []*protos.HealthEvent
+
+		for _, entry := range eventsWithTests {
+			if entry.HealthEvent != nil {
+				events = append(events, entry.HealthEvent)
+			}
+		}
+
 		isDrained, err := drain.IsNodeDrained(ctx, c.healthEventStore, nodeName, events, "", nil, c.partialDrainEnabled)
 		if err != nil {
 			return nil, "", fmt.Errorf("failed to look up drain status for node %s: %w", nodeName, err)
@@ -276,10 +283,29 @@ func (c *ValidationClient) FetchValidationTestsFromQuarantineSession(ctx context
 		}
 	}
 
-	sort.Strings(tests)
-	sort.Strings(eventIDs)
+	tests, ids := c.validationRequirements(eventsWithTests)
 
-	return slices.Compact(tests), validationSessionID(eventIDs), nil
+	return tests, validationSessionID(ids), nil
+}
+
+func (c *ValidationClient) validationRequirements(entries []common.HealthEventWithTests) (tests, ids []string) {
+	for _, entry := range entries {
+		if entry.HealthEvent == nil || len(entry.Tests) == 0 {
+			continue
+		}
+
+		ids = append(ids, entry.Id)
+
+		tests = append(tests, entry.Tests...)
+		if c.requireCompletedReboot {
+			tests = append(tests, entry.SessionTests...)
+		}
+	}
+
+	sort.Strings(tests)
+	sort.Strings(ids)
+
+	return slices.Compact(tests), ids
 }
 
 func (c *ValidationClient) CreateValidationRequest(ctx context.Context, node *corev1.Node, tests []string, sessionID,
@@ -296,7 +322,7 @@ func (c *ValidationClient) CreateValidationRequest(ctx context.Context, node *co
 			return fmt.Errorf("node %s was replaced before validation", node.Name)
 		}
 
-		rebootUID, err = c.completedSessionReboot(ctx, live, sessionID)
+		rebootUID, err = c.completedSessionReboot(ctx, live, sessionID, tests)
 		if err != nil {
 			return err
 		}

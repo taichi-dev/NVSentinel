@@ -18,7 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,8 +30,12 @@ import (
 
 	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
 	"github.com/nvidia/nvsentinel/commons/pkg/drain"
+	"github.com/nvidia/nvsentinel/commons/pkg/eventutil"
+	"github.com/nvidia/nvsentinel/data-models/pkg/model"
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
 	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
+	"github.com/nvidia/nvsentinel/store-client/pkg/query"
 )
 
 type restartMaintenance struct {
@@ -41,7 +45,7 @@ type restartMaintenance struct {
 
 // The restart group uses the maintenance creation time to decide which equivalent events it covers.
 func (c *ValidationClient) completedSessionReboot(ctx context.Context, node *corev1.Node,
-	session string) (string, error) {
+	session string, requestedTests []string) (string, error) {
 	var state struct {
 		EquivalenceGroups map[string]restartMaintenance `json:"equivalenceGroups"`
 	}
@@ -58,57 +62,167 @@ func (c *ValidationClient) completedSessionReboot(ctx context.Context, node *cor
 		return "", fmt.Errorf("read validation events: %w", err)
 	}
 
-	var ids []string
-
-	matched := false
-
-	for _, event := range events {
-		if event.HealthEvent == nil || len(event.Tests) == 0 {
-			continue
-		}
-
-		ids = append(ids, event.Id)
-
-		drained, err := c.restartCoversEvent(ctx, node.Name, restart, event.Id)
-		if err != nil {
-			return "", err
-		}
-
-		matched = matched || drained
+	tests, ids := c.validationRequirements(events)
+	if len(ids) == 0 || session != validationSessionID(ids) || !slices.Equal(requestedTests, tests) {
+		return "", fmt.Errorf("validation session changed on node %s", node.Name)
 	}
 
-	sort.Strings(ids)
-
-	if !matched || session != validationSessionID(ids) {
-		return "", fmt.Errorf("waiting for full drain and matching restart request for session %s", session)
+	if err := c.verifyRestartDrain(ctx, node.Name, restart, ids, c.knownOverflowTests(events, ids, tests)); err != nil {
+		return "", err
 	}
 
 	return c.completedRebootUID(ctx, node, restart.MaintenanceCR)
 }
 
-// A later fault needs its own repair. Only the request's initiating event proves the full drain.
-func (c *ValidationClient) restartCoversEvent(ctx context.Context, node string, restart restartMaintenance,
-	id string) (bool, error) {
-	record, health, err := drain.GetHealthEventByID(ctx, c.healthEventStore, node, id)
-	if err != nil {
-		return false, err
+// Older capped annotations have no test summary. Their retained tests suffice when they cover every enabled rule.
+func (c *ValidationClient) knownOverflowTests(events []common.HealthEventWithTests, ids, tests []string) bool {
+	if len(slices.Compact(slices.Clone(ids))) != maxQuarantineValidationHealthEvents || ids[0] == "" {
+		return false
 	}
 
+	if len(events[0].SessionTests) > 0 {
+		return true
+	}
+
+	for _, rule := range c.validationRuleSets {
+		for _, test := range c.validationRuleSetTestsMap[rule.GetName()] {
+			if !slices.Contains(tests, test) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+func (c *ValidationClient) verifyRestartDrain(ctx context.Context, node string, restart restartMaintenance,
+	ids []string, allowEvicted bool) error {
+	initiator := restart.initiator(node)
+	if initiator == "" {
+		return fmt.Errorf("missing restart for node %s", node)
+	}
+
+	retained := slices.Contains(ids, initiator)
+	if !retained && !allowEvicted {
+		return fmt.Errorf("cannot establish complete validation history for %s on %s", initiator, node)
+	}
+
+	if err := c.verifyCoveredFaults(ctx, node, restart, initiator, ids); err != nil {
+		return err
+	}
+
+	record, health, err := c.coveredFault(ctx, node, restart, initiator)
+	if err != nil {
+		return err
+	}
+
+	if err := c.requireFullDrain(record, health); err != nil {
+		return err
+	}
+
+	if !retained {
+		return c.verifyEvictedInitiator(ctx, node, initiator, record, restart)
+	}
+
+	return nil
+}
+
+func (c *ValidationClient) verifyCoveredFaults(ctx context.Context, node string, restart restartMaintenance,
+	initiator string, ids []string) error {
+	for _, id := range ids {
+		if id == initiator {
+			continue
+		}
+
+		if _, _, err := c.coveredFault(ctx, node, restart, id); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r restartMaintenance) initiator(node string) string {
+	id, ok := strings.CutPrefix(r.MaintenanceCR, "maintenance-"+node+"-")
+	if !ok {
+		return ""
+	}
+
+	return id
+}
+
+// Each retained fault must predate this repair. Only the CR's exact initiating document proves its drain.
+func (c *ValidationClient) coveredFault(ctx context.Context, node string, restart restartMaintenance, id string) (
+	*datastore.HealthEventWithStatus, *protos.HealthEvent, error) {
+	// Use the datastore ordering timestamp for both the receipt and the history query.
+	record, err := c.healthEventStore.FindLatestHealthEventByQuery(ctx, query.New().Build(query.Eq("_id", id)))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read fault %s for node %s: %w", id, node, err)
+	}
+
+	if record == nil {
+		return nil, nil, fmt.Errorf("missing fault %s on node %s", id, node)
+	}
+
+	parsed, err := eventutil.ParseHealthEventFromEvent(record.RawEvent)
+	if err != nil {
+		return nil, nil, fmt.Errorf("decode fault %s: %w", id, err)
+	}
+
+	health := parsed.HealthEvent
 	if id == "" || health.NodeName != node || health.IsHealthy || record.CreatedAt.IsZero() ||
 		record.CreatedAt.After(restart.CreatedAt) {
-		return false, fmt.Errorf("restart %s does not cover fault %s on %s", restart.MaintenanceCR, id, node)
+		return nil, nil, fmt.Errorf("restart %s does not cover fault %s on %s", restart.MaintenanceCR, id, node)
 	}
 
-	if restart.MaintenanceCR != "maintenance-"+node+"-"+id {
-		return false, nil
-	}
+	return record, health, nil
+}
 
+func (c *ValidationClient) requireFullDrain(record *datastore.HealthEventWithStatus, health *protos.HealthEvent) error {
 	partial, err := drain.PartialDrainEntity(health, c.partialDrainEnabled)
 	if err != nil {
-		return false, err
+		return err
 	}
 
-	return partial == nil && record.HealthEventStatus.UserPodsEvictionStatus.Status == datastore.StatusSucceeded, nil
+	if partial != nil || health.GetDrainOverrides().GetSkip() ||
+		record.HealthEventStatus.UserPodsEvictionStatus.Status != datastore.StatusSucceeded {
+		return fmt.Errorf("restart requires a successful full drain for its initiating event")
+	}
+
+	return nil
+}
+
+func (c *ValidationClient) verifyEvictedInitiator(ctx context.Context, node, id string,
+	record *datastore.HealthEventWithStatus, restart restartMaintenance) error {
+	status := record.HealthEventStatus.NodeQuarantined
+	if status == nil || (*status != datastore.Quarantined && *status != datastore.AlreadyQuarantined) {
+		return fmt.Errorf("restart initiator %s has no recorded quarantine on %s", id, node)
+	}
+
+	statuses := func(values ...any) query.Condition {
+		return query.Or(query.In("healtheventstatus.nodequarantined", values),
+			query.In("healtheventstatus.nodeQuarantined", values))
+	}
+	// Reject a later session boundary (including ambiguous timestamps) or an admitted fault after this repair.
+	boundary := query.And(query.Gte("createdAt", record.CreatedAt), query.Ne("_id", id),
+		statuses(string(model.Quarantined), string(model.UnQuarantined), string(model.Cancelled)))
+	laterFault := query.And(query.Gt("createdAt", restart.CreatedAt),
+		query.Or(query.Eq("healthevent.ishealthy", false), query.Eq("healthevent.ishealthy", nil)),
+		query.Or(query.Eq("healthevent.isHealthy", false), query.Eq("healthevent.isHealthy", nil)),
+		statuses(string(model.Quarantined), string(model.AlreadyQuarantined)))
+	sameNode := query.Or(query.Eq("healthevent.nodename", node), query.Eq("healthevent.nodeName", node))
+
+	conflict, err := c.healthEventStore.FindLatestHealthEventByQuery(ctx,
+		query.New().Build(query.And(sameNode, query.Or(boundary, laterFault))))
+	if err != nil {
+		return fmt.Errorf("check quarantine history for restart %s: %w", restart.MaintenanceCR, err)
+	}
+
+	if conflict != nil {
+		return fmt.Errorf("restart %s does not cover the current quarantine on %s", restart.MaintenanceCR, node)
+	}
+
+	return nil
 }
 
 // The generic provider stores its pre-reboot boot ID in the SignalSent condition.

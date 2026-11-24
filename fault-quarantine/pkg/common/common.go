@@ -31,6 +31,8 @@ var ErrRebootValidationPending = errors.New("waiting for post-reboot validation 
 type HealthEventWithTests struct {
 	*protos.HealthEvent
 	Tests []string `json:"tests,omitempty"`
+	// Stored on the first retained event once a strict session reaches its history limit.
+	SessionTests []string `json:"sessionTests,omitempty"`
 }
 
 // RuleEvaluationResult represents the result of a rule evaluation

@@ -358,6 +358,7 @@ func (r *Reconciler) configureColdStart(
 		coldStartUntil := time.Now().UTC()
 
 		if err := coldstart.Handle(ctx, coldstart.Dependencies{
+			HoldContactSupport: r.config.TomlConfig.HoldContactSupport,
 			HealthEventStore:   healthEventStore,
 			EventProcessor:     r.eventWatcher,
 			ColdStartAfterTime: effectiveColdStartAfter,
