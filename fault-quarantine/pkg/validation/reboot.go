@@ -280,7 +280,10 @@ func rebootSucceeded(conditions []metav1.Condition, currentBoot string) bool {
 		return false
 	}
 
-	return strings.TrimSpace(sent.Message) != "" && currentBoot != "" && currentBoot != sent.Message
+	previousBoot := strings.TrimSpace(sent.Message)
+	currentBoot = strings.TrimSpace(currentBoot)
+
+	return previousBoot != "" && currentBoot != "" && currentBoot != previousBoot
 }
 
 func conditionSucceeded(c *metav1.Condition) bool {

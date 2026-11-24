@@ -383,8 +383,7 @@ func (w *EventWatcher) liveProcessingError(ctx context.Context, recordUUID strin
 		return w.persistRebootWait(ctx, recordUUID)
 	}
 
-	if (w.rebootStore != nil && !coldstart.IsPermanentError(err)) ||
-		recheckNeedsReplay(event, err) {
+	if w.liveNeedsReplay(event, err) {
 		return &liveEventCompletionError{err: err}
 	}
 
@@ -726,7 +725,7 @@ func (w *EventWatcher) processHealthEvent(
 	}
 
 	status, processErr := w.processEventCallback(ctx, healthEventWithStatus)
-	if withholdProcessingStatus(ctx, healthEventWithStatus.HealthEvent, processErr) {
+	if w.withholdProcessingStatus(ctx, healthEventWithStatus.HealthEvent, processErr) {
 		// A partial status would remove this event from the next cold-start query,
 		// permanently losing any rule action skipped by the transient failure.
 		metrics.EventHandlingDuration.Observe(time.Since(startTime).Seconds())
@@ -755,12 +754,13 @@ func (w *EventWatcher) processHealthEvent(
 	return status != nil, processErr
 }
 
-func recheckNeedsReplay(event *protos.HealthEvent, err error) bool {
-	return event.GetMetadata()[common.GPURecheckRequestKey] != "" && err != nil && !coldstart.IsPermanentError(err)
+func (w *EventWatcher) liveNeedsReplay(event *protos.HealthEvent, err error) bool {
+	return err != nil && (w.rebootStore != nil || event.GetMetadata()[common.GPURecheckRequestKey] != "") &&
+		!coldstart.IsPermanentError(err)
 }
 
-func withholdProcessingStatus(ctx context.Context, event *protos.HealthEvent, err error) bool {
-	return errors.Is(err, common.ErrRebootValidationPending) || recheckNeedsReplay(event, err) ||
+func (w *EventWatcher) withholdProcessingStatus(ctx context.Context, event *protos.HealthEvent, err error) bool {
+	return errors.Is(err, common.ErrRebootValidationPending) || w.liveNeedsReplay(event, err) ||
 		(coldstart.IsRecoveryContext(ctx) && err != nil && !coldstart.IsPermanentError(err))
 }
 

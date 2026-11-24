@@ -754,6 +754,34 @@ func TestProcessEvent_LiveTransientFailureStillPersistsStatus(t *testing.T) {
 		"withholding partial status is recovery-only and must not change the established live path")
 }
 
+func TestRebootRecoveryTransientFailurePreservesLiveReplay(t *testing.T) {
+	const id = "fault-a"
+	db := &databaseClientStub{}
+	stream := &changeStreamWatcherStub{}
+	w := NewEventWatcher(stream, db, time.Minute, &objectIDStoreStub{})
+	w.ConfigureRebootRecovery(true, &deferredRecoveryStore{})
+	event := &clientEventStub{document: storedHealthEvent(id), recordUUID: id, eventID: "52"}
+	status := model.AlreadyQuarantined
+	processingErr := errors.New("node API unavailable")
+	w.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+		return &status, processingErr
+	})
+
+	require.ErrorIs(t, w.processAndCheckpoint(t.Context(), event), processingErr)
+	require.Zero(t, stream.markCalls)
+	require.Zero(t, db.completionCalls)
+	require.Zero(t, db.updateCalls, "a partial status makes the event terminal on restart")
+
+	w.recoveryOverlapCutoff = time.Now()
+	w.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+		return &status, nil
+	})
+	require.NoError(t, w.processAndCheckpoint(t.Context(), event))
+	require.Equal(t, 1, db.countCalls)
+	require.Equal(t, id, db.updatedID)
+	require.Equal(t, 1, stream.markCalls)
+}
+
 func TestRecoveryWaitingForRebootPersistsBeforeCheckpoint(t *testing.T) {
 	for _, writeFails := range []bool{false, true} {
 		t.Run(fmt.Sprint(writeFails), func(t *testing.T) {
