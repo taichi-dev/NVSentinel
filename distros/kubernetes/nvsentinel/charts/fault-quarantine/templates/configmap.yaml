@@ -34,6 +34,7 @@ data:
     {{- end }}
     
     [circuitBreaker]
+    allowRecovery = {{ .Values.circuitBreaker.allowRecovery | default false }}
     percentage = {{ .Values.circuitBreaker.percentage }}
     maxNodes = {{ .Values.circuitBreaker.maxNodes | default 0 }}
     maxCordonedNodes = {{ .Values.circuitBreaker.maxCordonedNodes | default 0 }}
@@ -86,6 +87,7 @@ data:
 
     {{- if .Values.validation.enabled }}
     [validation]
+      requireCompletedReboot = {{ .Values.validation.requireCompletedReboot | default false }}
       enabled = {{ .Values.validation.enabled }}
       apiGroup = {{ .Values.validation.apiGroup | quote }}
       version = {{ .Values.validation.version | quote }}

@@ -288,7 +288,7 @@ func (w *EventWatcher) processEvent(ctx context.Context, event client.Event) err
 
 	processed, err := w.processHealthEvent(ctx, &healthEventWithStatus, recordUUID, eventID)
 	if err != nil {
-		if recheckNeedsReplay(healthEventWithStatus.HealthEvent, err) {
+		if errors.Is(err, common.ErrRebootValidationPending) || recheckNeedsReplay(healthEventWithStatus.HealthEvent, err) {
 			return &liveEventCompletionError{err: err}
 		}
 
@@ -636,7 +636,7 @@ func recheckNeedsReplay(event *protos.HealthEvent, err error) bool {
 }
 
 func withholdProcessingStatus(ctx context.Context, event *protos.HealthEvent, err error) bool {
-	return recheckNeedsReplay(event, err) ||
+	return errors.Is(err, common.ErrRebootValidationPending) || recheckNeedsReplay(event, err) ||
 		(coldstart.IsRecoveryContext(ctx) && err != nil && !coldstart.IsPermanentError(err))
 }
 

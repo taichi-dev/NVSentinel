@@ -47,9 +47,10 @@ type Cordon struct {
 }
 
 type CircuitBreaker struct {
-	Percentage       int `toml:"percentage"`
-	MaxNodes         int `toml:"maxNodes"`
-	MaxCordonedNodes int `toml:"maxCordonedNodes"`
+	AllowRecovery    bool `toml:"allowRecovery"`
+	Percentage       int  `toml:"percentage"`
+	MaxNodes         int  `toml:"maxNodes"`
+	MaxCordonedNodes int  `toml:"maxCordonedNodes"`
 	// MaxCordonedPercentage is the percentage form of MaxCordonedNodes. When both are set
 	// the lower one binds.
 	MaxCordonedPercentage int    `toml:"maxCordonedPercentage"`
@@ -85,14 +86,15 @@ type ValidationRuleSet struct {
 // session's unhealthy events have all recovered and at least 1 event from the quarantine session required
 // a validation test according to Validation.RuleSets.
 type ValidationConfig struct {
-	Enabled           bool                `toml:"enabled"`
-	ApiGroup          string              `toml:"apiGroup"`
-	Version           string              `toml:"version"`
-	Kind              string              `toml:"kind"`
-	Resource          string              `toml:"resource"`
-	TemplateMountPath string              `toml:"templateMountPath"`
-	TemplateFileName  string              `toml:"templateFileName"`
-	RuleSets          []ValidationRuleSet `toml:"ruleSets"`
+	RequireCompletedReboot bool                `toml:"requireCompletedReboot"`
+	Enabled                bool                `toml:"enabled"`
+	ApiGroup               string              `toml:"apiGroup"`
+	Version                string              `toml:"version"`
+	Kind                   string              `toml:"kind"`
+	Resource               string              `toml:"resource"`
+	TemplateMountPath      string              `toml:"templateMountPath"`
+	TemplateFileName       string              `toml:"templateFileName"`
+	RuleSets               []ValidationRuleSet `toml:"ruleSets"`
 	// PartialDrainEnabled must match node-drainer's partialDrainEnabled.
 	PartialDrainEnabled bool `toml:"partialDrainEnabled"`
 }

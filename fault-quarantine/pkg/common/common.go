@@ -14,7 +14,14 @@
 
 package common
 
-import "github.com/nvidia/nvsentinel/data-models/pkg/protos"
+import (
+	"errors"
+
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+)
+
+// ErrRebootValidationPending keeps the final recovery replayable until the maintenance handoff succeeds.
+var ErrRebootValidationPending = errors.New("waiting for post-reboot validation handoff")
 
 // As part of the quarantineValidationHealthEvent annotation, we keep track of HealthEvents which contributed the
 // tests and the tests themselves. We will use the HealthEvent ID to check if the node was fully drained as part

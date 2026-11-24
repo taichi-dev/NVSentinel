@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
 	"github.com/nvidia/nvsentinel/commons/pkg/kubeclient"
 	"github.com/nvidia/nvsentinel/commons/pkg/labels"
 	"github.com/nvidia/nvsentinel/lifecycle-manager/api/v1alpha1"
@@ -81,6 +82,7 @@ type sessionEntry struct {
 	Name   string   `json:"name"`
 	Tests  []string `json:"tests,omitempty"`
 	Failed bool     `json:"failed,omitempty"`
+	BootID string   `json:"bootID,omitempty"`
 	// A missing value keeps the release policy of sessions written by older controllers.
 	CordonReleaseAllowed *bool `json:"cordonReleaseAllowed,omitempty"`
 }
@@ -175,6 +177,10 @@ func (r *ValidationRequestReconciler) addToSessionAndCheckEligibility(ctx contex
 		return true, false, fmt.Errorf("ensure session on node %q: %w", ns.Name, err)
 	}
 
+	if !validationBootMatches(validationRequest, &node) {
+		return true, false, nil
+	}
+
 	activeValidationRequest := node.Annotations[annotationActiveValidationRequest]
 	if len(activeValidationRequest) != 0 && activeValidationRequest != validationRequest.Name {
 		slog.InfoContext(ctx, "Node claimed by another validation request, waiting", "node", ns.Name,
@@ -215,7 +221,7 @@ func (r *ValidationRequestReconciler) updateValidationSession(ctx context.Contex
 		allowed := requestAllowsCordonRelease(validationRequest)
 		entries = append(entries, sessionEntry{
 			Name: validationRequest.Name, Tests: tests,
-			CordonReleaseAllowed: &allowed,
+			BootID: validationRequest.Annotations[annotation.ValidationBootID], CordonReleaseAllowed: &allowed,
 		})
 
 		if node.Annotations == nil {
@@ -253,7 +259,7 @@ func (r *ValidationRequestReconciler) releaseNodesFromSuccessfulRequest(ctx cont
 			}
 
 			if holdsEntry {
-				if err := r.checkNodeReadyForRelease(ctx, node); err != nil {
+				if err := r.checkNodeReadyForRelease(ctx, node, validationRequest); err != nil {
 					return false, err
 				}
 			}
@@ -303,7 +309,7 @@ func (r *ValidationRequestReconciler) checkNodesReadyForRelease(ctx context.Cont
 			continue
 		}
 
-		criterion, err := r.failedReadinessCriterion(ctx, &node)
+		criterion, err := r.failedReleaseCriterion(ctx, &node, validationRequest)
 		if err != nil {
 			return err
 		}
@@ -320,8 +326,9 @@ func (r *ValidationRequestReconciler) checkNodesReadyForRelease(ctx context.Cont
 	return nil
 }
 
-func (r *ValidationRequestReconciler) checkNodeReadyForRelease(ctx context.Context, node *corev1.Node) error {
-	criterion, err := r.failedReadinessCriterion(ctx, node)
+func (r *ValidationRequestReconciler) checkNodeReadyForRelease(ctx context.Context, node *corev1.Node,
+	request *v1alpha1.ValidationRequest) error {
+	criterion, err := r.failedReleaseCriterion(ctx, node, request)
 	if err != nil {
 		return err
 	}
@@ -331,6 +338,50 @@ func (r *ValidationRequestReconciler) checkNodeReadyForRelease(ctx context.Conte
 	}
 
 	return nil
+}
+
+func validationBootMatches(request *v1alpha1.ValidationRequest, node *corev1.Node) bool {
+	boot, bound := request.Annotations[annotation.ValidationBootID]
+	return !bound || (boot != "" && boot == node.Status.NodeInfo.BootID && annotation.HasNodeOwner(request, node))
+}
+
+func (r *ValidationRequestReconciler) failedReleaseCriterion(ctx context.Context, node *corev1.Node,
+	request *v1alpha1.ValidationRequest) (string, error) {
+	entries, err := parseSessionAnnotation(node.Annotations[annotationValidationSession])
+	if err != nil {
+		return "", err
+	}
+
+	for _, entry := range entries {
+		if entry.Name == request.Name && entry.BootID != "" &&
+			entry.BootID != request.Annotations[annotation.ValidationBootID] {
+			return "validated-boot", nil
+		}
+	}
+
+	if !validationBootMatches(request, node) {
+		return "validated-boot", nil
+	}
+
+	if _, bound := request.Annotations[annotation.ValidationBootID]; bound && !requiredTestsPassed(request, node.Name) {
+		return "required-test-passed", nil
+	}
+
+	return r.failedReadinessCriterion(ctx, node)
+}
+
+func requiredTestsPassed(request *v1alpha1.ValidationRequest, nodeName string) bool {
+	for _, test := range request.Spec.Tests {
+		passed := slices.ContainsFunc(request.Status.TestGroups, func(group v1alpha1.TestGroupStatus) bool {
+			return group.Phase == v1alpha1.PhaseSucceeded && slices.Contains(group.Nodes, nodeName) &&
+				slices.Contains(group.Tests, test)
+		})
+		if !passed {
+			return false
+		}
+	}
+
+	return len(request.Spec.Tests) > 0
 }
 
 // failedReadinessCriterion evaluates the configured readiness criteria against the given Node. It returns the name of
@@ -368,6 +419,14 @@ func (r *ValidationRequestReconciler) releaseNodesFromDeletedRequest(ctx context
 		retainedCriterion := ""
 
 		err := r.patchNodeWithRetry(ctx, ns.Name, func(node *corev1.Node) (bool, error) {
+			// Retain a failed entry so deleting a second, unrelated request cannot release the gate.
+			_, quarantine := validationRequest.Annotations[annotationCordonPreExisting]
+
+			_, bound := validationRequest.Annotations[annotation.ValidationBootID]
+			if quarantine || bound {
+				return markNodeSessionEntryFailed(node, validationRequest.Name)
+			}
+
 			schedulingGate, criterion, err := r.schedulingGateForDeletion(ctx, node, validationRequest)
 			if err != nil {
 				return false, err
@@ -427,7 +486,7 @@ func (r *ValidationRequestReconciler) schedulingGateForDeletion(ctx context.Cont
 	return schedulingGate, "", nil
 }
 
-const annotationCordonPreExisting = "nvsentinel.nvidia.com/cordon-pre-existing"
+const annotationCordonPreExisting = annotation.CordonPreExisting
 
 // Requests without a recorded cordon decision retain their configured release behavior.
 func requestAllowsCordonRelease(request *v1alpha1.ValidationRequest) bool {
@@ -641,14 +700,23 @@ func (r *ValidationRequestReconciler) patchNodeWithRetry(ctx context.Context, no
 	})
 }
 
+func requestBootBound(entries []sessionEntry, name string) bool {
+	return slices.ContainsFunc(entries, func(e sessionEntry) bool { return e.Name == name && e.BootID != "" })
+}
+
+func (e sessionEntry) supersededBy(tests []string, bootBound bool) bool {
+	return tests != nil && e.Failed && (e.BootID == "" || bootBound) && sameTests(e.Tests, tests)
+}
+
 func removeSessionEntry(entries []sessionEntry, validationRequestName string,
 	supersedeTests []string) (remaining []sessionEntry, sessionBecameEmpty bool) {
+	bootBound := requestBootBound(entries, validationRequestName)
 	for _, e := range entries {
 		if e.Name == validationRequestName {
 			continue
 		}
 
-		if supersedeTests != nil && e.Failed && sameTests(e.Tests, supersedeTests) {
+		if e.supersededBy(supersedeTests, bootBound) {
 			continue
 		}
 

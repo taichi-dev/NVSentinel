@@ -529,7 +529,8 @@ func (r *Reconciler) initializeQuarantineMetrics(ctx context.Context) {
 // Returns error if retry exhaustion occurs (should restart pod)
 // Blocks indefinitely if circuit breaker is tripped (wait for manual intervention)
 func (r *Reconciler) checkCircuitBreakerAtStartup(ctx context.Context) error {
-	if !r.breakerActive() {
+	// In recovery mode each new isolation checks the breaker at admission.
+	if !r.breakerActive() || r.config.TomlConfig.CircuitBreaker.AllowRecovery {
 		return nil
 	}
 
@@ -641,7 +642,7 @@ func (r *Reconciler) ProcessEvent(
 func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context) (bool, error) {
 	span := tracing.SpanFromContext(ctx)
 
-	if !r.breakerActive() {
+	if !r.breakerActive() || r.config.TomlConfig.CircuitBreaker.AllowRecovery {
 		return false, nil
 	}
 
@@ -683,6 +684,38 @@ func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context) (bool, erro
 	return false, nil
 }
 
+// At capacity, keep tracking faults on cordoned nodes without starting a new quarantine.
+func (r *Reconciler) allowIsolation(ctx context.Context, event *protos.HealthEvent,
+	existing bool) (context.Context, bool, error) {
+	if !r.breakerActive() || !r.config.TomlConfig.CircuitBreaker.AllowRecovery || event.IsHealthy {
+		return ctx, true, nil
+	}
+
+	tripped, err := r.cb.IsTripped(ctx)
+	if err != nil {
+		return ctx, false, fmt.Errorf("check circuit breaker: %w", err)
+	}
+
+	if !tripped {
+		return ctx, true, nil
+	}
+
+	if !existing {
+		slog.WarnContext(ctx, "Circuit breaker suppressed new quarantine", "node", event.NodeName)
+		return ctx, false, nil
+	}
+
+	return informer.WithNodeGuard(ctx, requireCordonedSession), true, nil
+}
+
+func requireCordonedSession(node *corev1.Node) error {
+	if !node.Spec.Unschedulable || node.Annotations[common.QuarantineHealthEventAnnotationKey] == "" {
+		return fmt.Errorf("circuit breaker requires existing cordoned quarantine")
+	}
+
+	return nil
+}
+
 //nolint:cyclop // Coordinates distinct quarantine branches; helpers own the detailed operations.
 func (r *Reconciler) handleEvent(
 	ctx context.Context,
@@ -698,6 +731,11 @@ func (r *Reconciler) handleEvent(
 		slog.ErrorContext(ctx, "Failed to determine existing node quarantine",
 			"node", event.HealthEvent.NodeName, "error", err)
 
+		return nil, err
+	}
+
+	ctx, allowed, err := r.allowIsolation(ctx, event.HealthEvent, quarantineAnnotationExists)
+	if err != nil || !allowed {
 		return nil, err
 	}
 
@@ -867,7 +905,8 @@ func (r *Reconciler) handleAlreadyQuarantinedNode(
 
 	// As when the first quarantine fails, write no status, so that cold start replays the event and applies it
 	// again. A replay is safe: the event is skipped where it is already tracked or its actions already applied.
-	if errors.Is(processingErr, errQuarantinedNodeNotUpdated) {
+	if errors.Is(processingErr, errQuarantinedNodeNotUpdated) ||
+		errors.Is(processingErr, common.ErrRebootValidationPending) {
 		return nil, errors.Join(eligibilityErr, processingErr)
 	}
 
@@ -1421,7 +1460,7 @@ func (r *Reconciler) breakerActive() bool {
 // recordCordonEventInCircuitBreaker records a cordon event in the circuit breaker if enabled
 func (r *Reconciler) recordCordonEventInCircuitBreaker(event *model.HealthEventWithStatus) {
 	if r.breakerActive() &&
-		(event.HealthEvent.QuarantineOverrides == nil || !event.HealthEvent.QuarantineOverrides.Force) {
+		(r.config.TomlConfig.CircuitBreaker.AllowRecovery || !r.isForceQuarantine(event.HealthEvent)) {
 		r.cb.AddCordonEvent(event.HealthEvent.NodeName)
 	}
 }
@@ -2256,6 +2295,10 @@ func (r *Reconciler) triggerValidationOnUnquarantine(ctx context.Context, span t
 
 	validationRequestCreated, err := r.createValidationRequestIfRequested(ctx, event, annotations)
 	if err != nil {
+		if r.config.TomlConfig.Validation.RequireCompletedReboot {
+			err = errors.Join(common.ErrRebootValidationPending, err)
+		}
+
 		slog.ErrorContext(ctx, "Failed to create ValidationRequest for node, keeping node quarantined",
 			"node", event.NodeName, "error", err)
 		metrics.ProcessingErrors.WithLabelValues("create_validation_request_error").Inc()
@@ -2297,6 +2340,10 @@ func (r *Reconciler) createValidationRequestIfRequested(ctx context.Context, eve
 	}
 
 	if len(tests) == 0 {
+		if r.config.TomlConfig.Validation.RequireCompletedReboot {
+			return false, fmt.Errorf("missing tests for reboot validation")
+		}
+
 		return false, nil
 	}
 

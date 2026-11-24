@@ -77,7 +77,8 @@ func NewNodeDrainEvaluator(
 
 // checkPreconditions returns an early result if the event should not proceed
 // to full drain evaluation. Returns nil if evaluation should continue.
-func checkPreconditions(ctx context.Context, healthEvent model.HealthEventWithStatus) *DrainActionResult {
+func (e *NodeDrainEvaluator) checkPreconditions(ctx context.Context,
+	healthEvent model.HealthEventWithStatus) *DrainActionResult {
 	nodeName := healthEvent.HealthEvent.NodeName
 
 	if healthEvent.HealthEventStatus == nil {
@@ -108,8 +109,7 @@ func checkPreconditions(ctx context.Context, healthEvent model.HealthEventWithSt
 	// fault-remediation can proceed immediately without waiting for pods.
 	// This is used by ergatos debug events where drain is intentionally
 	// skipped to test the Slack notification pipeline.
-	if healthEvent.HealthEvent.DrainOverrides != nil &&
-		healthEvent.HealthEvent.DrainOverrides.Skip {
+	if !e.config.RequirePodTermination && healthEvent.HealthEvent.GetDrainOverrides().GetSkip() {
 		slog.InfoContext(ctx, "DrainOverrides.Skip is true, skipping drain for node",
 			"node", nodeName)
 
@@ -122,7 +122,7 @@ func checkPreconditions(ctx context.Context, healthEvent model.HealthEventWithSt
 // EvaluateEventWithDatabase evaluates using the new database-agnostic interface
 func (e *NodeDrainEvaluator) EvaluateEventWithDatabase(ctx context.Context, healthEvent model.HealthEventWithStatus,
 	database queue.DataStore, healthEventStore datastore.HealthEventStore) (*DrainActionResult, error) {
-	if result := checkPreconditions(ctx, healthEvent); result != nil {
+	if result := e.checkPreconditions(ctx, healthEvent); result != nil {
 		return result, nil
 	}
 
@@ -165,9 +165,28 @@ func (e *NodeDrainEvaluator) EvaluateEventWithDatabase(ctx context.Context, heal
 		return r, err
 	}
 
-	r, err := e.evaluateUserNamespaceActions(ctx, healthEvent, partialDrainEntity)
+	return e.evaluateNativeDrain(ctx, healthEvent, partialDrainEntity)
+}
 
-	return r, err
+func (e *NodeDrainEvaluator) evaluateNativeDrain(ctx context.Context, healthEvent model.HealthEventWithStatus,
+	partialDrainEntity *protos.Entity) (*DrainActionResult, error) {
+	nodeName := healthEvent.HealthEvent.NodeName
+
+	action, err := e.evaluateUserNamespaceActions(ctx, healthEvent, partialDrainEntity)
+	if err != nil || !e.config.RequirePodTermination || action.Status != model.StatusSucceeded {
+		return action, err
+	}
+
+	namespaces := e.config.UserNamespaces
+	if len(e.config.PodDrainPolicies) > 0 {
+		namespaces = nil
+	}
+
+	if err := e.informers.VerifyLiveDrain(ctx, nodeName, partialDrainEntity, namespaces, e.podPolicies); err != nil {
+		return nil, fmt.Errorf("verify live drain on node %s: %w", nodeName, err)
+	}
+
+	return action, nil
 }
 
 // shouldUseCustomDrain reports whether the node is drained by the custom drain plugin
@@ -605,6 +624,11 @@ func (e *NodeDrainEvaluator) isNodeAlreadyDrained(ctx context.Context, currentEv
 		slog.InfoContext(ctx, "No quarantine annotation found for node", "node", nodeName)
 
 		return false, false, nil
+	}
+
+	if e.config.RequirePodTermination {
+		// The session still exists, but an earlier drain says nothing about its current pods.
+		return false, true, nil
 	}
 
 	var healthEventsMap annotation.HealthEventsAnnotationMap

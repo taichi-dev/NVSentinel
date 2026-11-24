@@ -27,12 +27,14 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -41,9 +43,11 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
+	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
 	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/config"
 	"github.com/nvidia/nvsentinel/node-drainer/pkg/metrics"
 )
 
@@ -61,6 +65,7 @@ type Informers struct {
 	notReadyTimeoutMinutes *int
 	drainGPUPods           bool
 	requirePodTermination  bool
+	systemNamespaces       *regexp.Regexp
 	dryRunMode             []string
 }
 
@@ -118,6 +123,7 @@ func NewInformers(clientset kubernetes.Interface, resyncPeriod time.Duration,
 
 	return &Informers{
 		clientset:        clientset,
+		systemNamespaces: systemNamespacesRegex,
 		podInformer:      podInformer,
 		nodeInformer:     nodeInformer,
 		eventBroadcaster: eventBroadcaster,
@@ -384,6 +390,111 @@ func (i *Informers) FindEvictablePodsInNamespaceAndNode(ctx context.Context, nam
 			}
 		}
 	}
+
+	return i.filterDrainScope(ctx, pods, partialDrainEntity, nodeName)
+}
+
+// VerifyLiveDrain takes one API snapshot across every namespace immediately before success.
+func (i *Informers) VerifyLiveDrain(ctx context.Context, nodeName string, entity *protos.Entity,
+	namespaces []config.UserNamespace, policies *config.PodPolicyMatcher) error {
+	selector := fields.OneTermEqualSelector("spec.nodeName", nodeName)
+
+	list, err := i.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: selector.String()})
+	if err != nil {
+		return fmt.Errorf("list pods: %w", err)
+	}
+
+	var selected []*v1.Pod
+
+	for idx := range list.Items {
+		pod := &list.Items[idx]
+
+		matches, err := i.inDrainScope(pod, namespaces, policies)
+		if err != nil {
+			return err
+		}
+
+		if matches {
+			selected = append(selected, pod)
+		}
+	}
+
+	remaining, err := i.filterDrainScope(ctx, selected, entity, nodeName)
+	if err != nil {
+		return err
+	}
+
+	if len(remaining) != 0 {
+		return fmt.Errorf("waiting for %d eligible pods", len(remaining))
+	}
+
+	return i.verifyKubeletHeartbeat(ctx, nodeName)
+}
+
+func (i *Informers) inDrainScope(pod *v1.Pod, namespaces []config.UserNamespace,
+	policies *config.PodPolicyMatcher) (bool, error) {
+	if i.systemNamespaces != nil && i.systemNamespaces.MatchString(pod.Namespace) {
+		return false, nil
+	}
+
+	if len(namespaces) == 0 {
+		_, matched := policies.Match(pod)
+		return matched, nil
+	}
+
+	for _, ns := range namespaces {
+		matches, err := filepath.Match(ns.Name, pod.Namespace)
+		if err != nil {
+			return false, fmt.Errorf("match namespace %q: %w", ns.Name, err)
+		}
+
+		if matches {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func (i *Informers) verifyKubeletHeartbeat(ctx context.Context, nodeName string) error {
+	node, err := i.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read node readiness: %w", err)
+	}
+
+	ready := slices.ContainsFunc(node.Status.Conditions, func(c v1.NodeCondition) bool {
+		return c.Type == v1.NodeReady && c.Status == v1.ConditionTrue
+	})
+	if !ready || node.DeletionTimestamp != nil {
+		return fmt.Errorf("node %s is not Ready", nodeName)
+	}
+
+	lease, err := i.clientset.CoordinationV1().Leases("kube-node-lease").Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read kubelet heartbeat: %w", err)
+	}
+
+	if !annotation.HasNodeOwner(lease, node) || !currentKubeletLease(lease.Spec, nodeName, time.Now()) {
+		return fmt.Errorf("no current kubelet heartbeat for node %s", nodeName)
+	}
+
+	return nil
+}
+
+func currentKubeletLease(spec coordinationv1.LeaseSpec, nodeName string, now time.Time) bool {
+	if spec.HolderIdentity == nil || *spec.HolderIdentity != nodeName ||
+		spec.RenewTime == nil || spec.LeaseDurationSeconds == nil {
+		return false
+	}
+
+	duration := time.Duration(*spec.LeaseDurationSeconds) * time.Second
+
+	return duration > 0 && now.Before(spec.RenewTime.Add(duration))
+}
+
+func (i *Informers) filterDrainScope(ctx context.Context, pods []*v1.Pod,
+	partialDrainEntity *protos.Entity, nodeName string) ([]*v1.Pod, error) {
+	var err error
 
 	pods = i.filterEvictablePods(pods, partialDrainEntity)
 

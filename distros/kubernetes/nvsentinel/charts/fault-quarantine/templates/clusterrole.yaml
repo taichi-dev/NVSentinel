@@ -44,4 +44,10 @@ rules:
   - {{ printf "%ss" (.Values.validation.kind | lower) }}
   verbs:
   - create
+{{- if .Values.validation.requireCompletedReboot }}
+  - get
+- apiGroups: ["janitor.dgxc.nvidia.com"]
+  resources: ["rebootnodes"]
+  verbs: ["get"]
+{{- end }}
 {{- end }}

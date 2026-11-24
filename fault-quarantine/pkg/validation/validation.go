@@ -21,14 +21,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"text/template"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
 	"github.com/nvidia/nvsentinel/commons/pkg/drain"
 	"github.com/nvidia/nvsentinel/commons/pkg/templates"
 	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
@@ -43,7 +46,7 @@ import (
 // hold. When exceeded, the oldest entries are dropped.
 const maxQuarantineValidationHealthEvents = 10
 
-const annotationCordonPreExisting = "nvsentinel.nvidia.com/cordon-pre-existing"
+const annotationCordonPreExisting = annotation.CordonPreExisting
 
 type ValidationClient struct {
 	k8sClient        *informer.FaultQuarantineClient
@@ -55,7 +58,8 @@ type ValidationClient struct {
 	resourceTemplate *template.Template
 	resourceGVR      schema.GroupVersionResource
 
-	partialDrainEnabled bool
+	partialDrainEnabled    bool
+	requireCompletedReboot bool
 }
 
 type templateData struct {
@@ -107,6 +111,7 @@ func NewValidationClient(cfg config.TomlConfig, k8sClient *informer.FaultQuarant
 		resourceTemplate:          validationTemplate,
 		resourceGVR:               gvr,
 		partialDrainEnabled:       cfg.Validation.PartialDrainEnabled,
+		requireCompletedReboot:    cfg.Validation.RequireCompletedReboot,
 	}, nil
 }
 
@@ -235,7 +240,6 @@ func (c *ValidationClient) FetchValidationTestsFromQuarantineSession(ctx context
 	}
 
 	events := make([]*protos.HealthEvent, 0, len(eventsWithTests))
-	seenTests := make(map[string]struct{})
 
 	var tests, eventIDs []string
 
@@ -252,34 +256,49 @@ func (c *ValidationClient) FetchValidationTestsFromQuarantineSession(ctx context
 
 		eventIDs = append(eventIDs, event.Id)
 
-		for _, test := range event.Tests {
-			if _, ok := seenTests[test]; !ok {
-				seenTests[test] = struct{}{}
-				tests = append(tests, test)
-			}
+		tests = append(tests, event.Tests...)
+	}
+
+	if !c.requireCompletedReboot {
+		isDrained, err := drain.IsNodeDrained(ctx, c.healthEventStore, nodeName, events, "", nil, c.partialDrainEnabled)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to look up drain status for node %s: %w", nodeName, err)
 		}
-	}
 
-	isDrained, err := drain.IsNodeDrained(ctx, c.healthEventStore, nodeName, events, "", nil,
-		c.partialDrainEnabled)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to look up drain status for node %s: %w", nodeName, err)
-	}
-
-	if !isDrained {
-		slog.InfoContext(ctx, "Skipping validation: no contributing event completed its drain", "node", nodeName)
-
-		return nil, "", nil
+		if !isDrained {
+			return nil, "", nil
+		}
 	}
 
 	sort.Strings(tests)
 	sort.Strings(eventIDs)
 
-	return tests, sessionID(eventIDs), nil
+	return slices.Compact(tests), validationSessionID(eventIDs), nil
 }
 
 func (c *ValidationClient) CreateValidationRequest(ctx context.Context, node *corev1.Node, tests []string, sessionID,
 	traceID, spanID string) error {
+	var rebootUID string
+
+	if c.requireCompletedReboot {
+		live, err := c.k8sClient.Clientset.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("read node for reboot validation: %w", err)
+		}
+
+		if live.UID != node.UID {
+			return fmt.Errorf("node %s was replaced before validation", node.Name)
+		}
+
+		rebootUID, err = c.completedSessionReboot(ctx, live, sessionID)
+		if err != nil {
+			return err
+		}
+
+		node = live
+		sessionID = validationSessionID([]string{sessionID, rebootUID, node.Status.NodeInfo.BootID})
+	}
+
 	data := templateData{
 		NodeName:  node.Name,
 		SessionID: sessionID,
@@ -305,7 +324,13 @@ func (c *ValidationClient) CreateValidationRequest(ctx context.Context, node *co
 		common.QuarantineHealthEventCordonPreExistingAnnotationValue ||
 		node.Annotations[common.QuarantineHealthEventIsCordonedAnnotationKey] !=
 			common.QuarantineHealthEventIsCordonedAnnotationValueTrue
+
 	annotations[annotationCordonPreExisting] = strconv.FormatBool(preExisting)
+	if c.requireCompletedReboot {
+		annotations[annotation.ValidationBootID] = node.Status.NodeInfo.BootID
+		annotations[annotation.RebootUID] = rebootUID
+	}
+
 	validationObject.SetAnnotations(annotations)
 
 	return c.k8sClient.CreateValidationRequestResource(ctx, c.resourceGVR, validationObject)
@@ -341,8 +366,8 @@ func (c *ValidationClient) getTestsForHealthEvent(ctx context.Context, event *pr
 	return tests
 }
 
-// sessionID derives a deterministic name suffix from the sorted event IDs that contributed tests.
-func sessionID(eventIDs []string) string {
+// validationSessionID derives a deterministic name suffix from the sorted event IDs that contributed tests.
+func validationSessionID(eventIDs []string) string {
 	sum := sha256.Sum256([]byte(strings.Join(eventIDs, ",")))
 	return hex.EncodeToString(sum[:])[:12]
 }

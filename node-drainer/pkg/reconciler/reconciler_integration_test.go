@@ -1486,6 +1486,7 @@ func setupConfiguredTest(t *testing.T, tomlConfig config.TomlConfig, dryRun bool
 	)
 	require.NoError(t, err)
 
+	informersInstance.SetRequirePodTermination(tomlConfig.RequirePodTermination)
 	go func() { _ = informersInstance.Run(ctx) }()
 	require.Eventually(t, informersInstance.HasSynced, 30*time.Second, 1*time.Second)
 

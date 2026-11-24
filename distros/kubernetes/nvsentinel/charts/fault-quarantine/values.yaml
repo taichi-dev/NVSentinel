@@ -59,6 +59,8 @@ labelPrefix: "k8saas.nvidia.com/"
 gpuNodeLabel: "nvidia.com/gpu.present=true"
 
 circuitBreaker:
+  # Continue processing recoveries at the limit. New quarantines are suppressed while tripped.
+  allowRecovery: false
   # Enable/disable circuit breaker protection (passed as command-line arg to the deployment)
   enabled: true
   # Maximum percentage of GPU nodes (identified by gpuNodeLabel) that can be quarantined
@@ -286,6 +288,8 @@ ruleSets:
 # occurred during the quarantine session and these tests are derived from the ruleSets
 # section below.
 validation:
+  # Wait for the generic provider's completed RebootNode in the restart group and validate its new boot.
+  requireCompletedReboot: false
   enabled: false
   # Whether node-drainer drains COMPONENT_RESET events partially. Must match
   # node-drainer.partialDrainEnabled. While true, a COMPONENT_RESET event's drain never counts as a

@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -124,12 +125,41 @@ func (c *FaultQuarantineClient) CreateValidationRequestResource(ctx context.Cont
 		return nil
 	}
 
-	_, err := c.DynamicClient.Resource(gvr).Create(ctx, obj, metav1.CreateOptions{})
+	resources := c.DynamicClient.Resource(gvr)
+
+	_, err := resources.Create(ctx, obj, metav1.CreateOptions{})
+	if errors.IsAlreadyExists(err) && obj.GetAnnotations()[annotationutil.ValidationBootID] != "" {
+		existing, getErr := resources.Get(ctx, obj.GetName(), metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("read existing validation request: %w", getErr)
+		}
+
+		if !sameValidationEvidence(existing, obj) {
+			return fmt.Errorf("existing validation request %s does not match the maintenance handoff", obj.GetName())
+		}
+	}
+
 	if err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create ValidationRequest %s: %w", obj.GetName(), err)
 	}
 
 	return nil
+}
+
+func sameValidationEvidence(a, b *unstructured.Unstructured) bool {
+	if a.GetDeletionTimestamp() != nil || !reflect.DeepEqual(a.Object["spec"], b.Object["spec"]) ||
+		!reflect.DeepEqual(a.GetOwnerReferences(), b.GetOwnerReferences()) {
+		return false
+	}
+
+	keys := []string{annotationutil.ValidationBootID, annotationutil.RebootUID, annotationutil.CordonPreExisting}
+	for _, key := range keys {
+		if a.GetAnnotations()[key] != b.GetAnnotations()[key] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (c *FaultQuarantineClient) EnsureCircuitBreakerConfigMap(ctx context.Context,
@@ -956,6 +986,16 @@ type nodeGuardContextKey struct{}
 func WithNodeGuard(ctx context.Context, guard func(*v1.Node) error) context.Context {
 	if guard == nil {
 		return ctx
+	}
+
+	if previous, ok := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error); ok {
+		return context.WithValue(ctx, nodeGuardContextKey{}, func(node *v1.Node) error {
+			if err := previous(node); err != nil {
+				return err
+			}
+
+			return guard(node)
+		})
 	}
 
 	return context.WithValue(ctx, nodeGuardContextKey{}, guard)

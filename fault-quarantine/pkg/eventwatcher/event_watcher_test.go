@@ -28,6 +28,7 @@ import (
 	"github.com/nvidia/nvsentinel/commons/pkg/eventutil"
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/coldstart"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
 	"github.com/nvidia/nvsentinel/store-client/pkg/client"
 	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
 	"github.com/nvidia/nvsentinel/store-client/pkg/query"
@@ -750,6 +751,33 @@ func TestProcessEvent_LiveTransientFailureStillPersistsStatus(t *testing.T) {
 	require.ErrorIs(t, err, processingErr)
 	assert.Equal(t, 1, dbClient.updateCalls,
 		"withholding partial status is recovery-only and must not change the established live path")
+}
+
+func TestRecoveryWaitingForRebootPreservesReplay(t *testing.T) {
+	doc := storedHealthEvent("recovery")
+	doc["healthevent"].(datastore.Event)["isHealthy"] = true
+	event := &clientEventStub{document: doc, eventID: "52", recordUUID: "recovery", token: []byte("token")}
+	stream := &changeStreamWatcherStub{}
+	db := &databaseClientStub{}
+	watcher := NewEventWatcher(stream, db, time.Minute, &objectIDStoreStub{})
+	process := func(result error) error {
+		events := make(chan client.Event, 1)
+		events <- event
+		close(events)
+		stream.events = events
+		watcher.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+			status := model.UnQuarantined
+			return &status, result
+		})
+		return watcher.watchEvents(t.Context())
+	}
+	require.ErrorIs(t, process(common.ErrRebootValidationPending), common.ErrRebootValidationPending)
+	require.Zero(t, db.updateCalls)
+	require.Zero(t, db.completionCalls)
+	require.Zero(t, stream.markCalls)
+	require.NoError(t, process(nil))
+	require.Equal(t, 1, db.updateCalls)
+	require.Equal(t, 1, stream.markCalls)
 }
 
 func TestWatchEvents_RecheckFailurePreservesReplay(t *testing.T) {
