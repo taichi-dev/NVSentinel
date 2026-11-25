@@ -54,9 +54,13 @@ func (p *NodePatcher) Patch(
 	return p.patch(ctx, nodes, nodeName, cached, mutate, false)
 }
 
-// PatchGuarded rechecks a live precondition on every retry, including metadata-only writes.
+// PatchGuarded reads the live Node and checks its version even for metadata-only writes.
+// An optional guard is evaluated before each mutation.
 func (p *NodePatcher) PatchGuarded(ctx context.Context, nodes typedcorev1.NodeInterface, nodeName string,
 	guard, mutate func(*v1.Node) error) (bool, error) {
+	if guard == nil {
+		return p.patch(ctx, nodes, nodeName, nil, mutate, true)
+	}
 	return p.patch(ctx, nodes, nodeName, nil, func(node *v1.Node) error {
 		if err := guard(node); err != nil {
 			return err

@@ -378,10 +378,21 @@ func TestE2E_LiveQuarantineRemovesLeftoverDryRunMarker(t *testing.T) {
 	})
 
 	addMarker := func() {
+		nodes := r.k8sClient.NodeInformer
+		before, err := nodes.GetNode(nodeName)
+		require.NoError(t, err)
 		patch := fmt.Sprintf(`{"metadata":{"annotations":{%q:%q}}}`,
 			common.QuarantineHealthEventDryRunAnnotationKey, common.QuarantineHealthEventDryRunAnnotationValue)
-		_, err := e2eTestClient.CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
+		marked, err := e2eTestClient.CoreV1().Nodes().Patch(
+			ctx, nodeName, types.MergePatchType, []byte(patch), metav1.PatchOptions{},
+		)
 		require.NoError(t, err)
+		// Deliver the health event with the last informer snapshot before the external write.
+		require.Eventually(t, func() bool {
+			cached, err := nodes.GetNode(nodeName)
+			return err == nil && cached.ResourceVersion == marked.ResourceVersion
+		}, statusCheckTimeout, statusCheckPollInterval)
+		require.NoError(t, nodes.GetInformer().GetStore().Update(before))
 	}
 
 	send := func(gpu string, want model.Status) {
