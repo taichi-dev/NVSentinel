@@ -233,6 +233,33 @@ func TestQuarantineNodeAndSetAnnotations_QPSControlledCordonThroughput_HigherQPS
 	assert.LessOrEqual(t, throughputRatio, 14.0)
 }
 
+func TestLiveQuarantineRemovesDryRunMarkerMissingFromCache(t *testing.T) {
+	ctx := t.Context()
+	nodes := testClient.CoreV1().Nodes()
+	name := testutils.GenerateTestNodeName("stale-dry-run")
+	createTestNode(ctx, t, name, nil, nil, nil, true)
+	t.Cleanup(func() { _ = nodes.Delete(context.Background(), name, metav1.DeleteOptions{}) })
+
+	cached, err := nodes.Get(ctx, name, metav1.GetOptions{})
+	require.NoError(t, err)
+	client := &FaultQuarantineClient{Clientset: testClient, NodeInformer: cachedNodeInformer(t, cached)}
+	live := cached.DeepCopy()
+	live.Annotations = map[string]string{common.QuarantineHealthEventDryRunAnnotationKey: "true", "keep": "yes"}
+	_, err = nodes.Update(ctx, live, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	const sessionRecord = `[{"checkName":"GpuXidError"}]`
+	session := map[string]string{common.QuarantineHealthEventAnnotationKey: sessionRecord}
+	_, err = client.QuarantineNodeAndSetAnnotations(ctx, name, nil, true, session, nil)
+	require.NoError(t, err)
+	got, err := nodes.Get(ctx, name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, got.Annotations, common.QuarantineHealthEventDryRunAnnotationKey)
+	assert.Equal(t, sessionRecord, got.Annotations[common.QuarantineHealthEventAnnotationKey])
+	assert.Equal(t, "yes", got.Annotations["keep"])
+	assert.True(t, got.Spec.Unschedulable)
+}
+
 func TestQuarantineNodeAndSetAnnotations(t *testing.T) {
 	ctx := context.Background()
 	nodeName := testutils.GenerateTestNodeName("test-taint-cordon")

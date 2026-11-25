@@ -230,6 +230,20 @@ func (c *FaultQuarantineClient) SetLabelKeys(cordonedReasonKey, uncordonedReason
 }
 
 func (c *FaultQuarantineClient) UpdateNode(ctx context.Context, nodeName string, updateFn func(*v1.Node) error) error {
+	return c.updateNode(ctx, nodeName, updateFn, false)
+}
+
+// UpdateQuarantineNode reads the live session before changing a real quarantine.
+// A newly written dry-run marker may still be missing from the informer.
+func (c *FaultQuarantineClient) UpdateQuarantineNode(
+	ctx context.Context, nodeName string, updateFn func(*v1.Node) error,
+) error {
+	return c.updateNode(ctx, nodeName, updateFn, !c.DryRunMode)
+}
+
+func (c *FaultQuarantineClient) updateNode(
+	ctx context.Context, nodeName string, updateFn func(*v1.Node) error, readLive bool,
+) error {
 	mu, _ := c.operationMutex.LoadOrStore(nodeName, &sync.Mutex{})
 	mu.(*sync.Mutex).Lock()
 
@@ -241,7 +255,9 @@ func (c *FaultQuarantineClient) UpdateNode(ctx context.Context, nodeName string,
 		changed bool
 		err     error
 	)
-	if guard, ok := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error); ok {
+
+	guard, _ := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error)
+	if readLive || guard != nil {
 		changed, err = c.nodePatcher.PatchGuarded(ctx, nodes, nodeName, guard, updateFn)
 	} else {
 		changed, err = c.nodePatcher.Patch(ctx, nodes, nodeName, c.cachedNodeForPatch(nodeName), updateFn)
@@ -410,7 +426,8 @@ func (c *FaultQuarantineClient) QuarantineNodeAndSetAnnotations(
 		return nil
 	}
 
-	err := c.UpdateNode(ctx, nodename, updateFn)
+	readLive := !c.DryRunMode && annotations[common.QuarantineHealthEventAnnotationKey] != ""
+	err := c.updateNode(ctx, nodename, updateFn, readLive)
 
 	return alreadyQuarantined, err
 }

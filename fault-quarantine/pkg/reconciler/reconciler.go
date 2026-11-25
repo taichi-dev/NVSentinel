@@ -2135,7 +2135,7 @@ func (r *Reconciler) addEventToAnnotation(
 		return r.updateValidationAnnotation(ctx, node.Annotations, event)
 	}
 
-	return r.k8sClient.UpdateNode(ctx, event.NodeName, updateFn)
+	return r.k8sClient.UpdateQuarantineNode(ctx, event.NodeName, updateFn)
 }
 
 // updateValidationAnnotation adds or updates a HealthEvent to the node's quarantineValidationHealthEvent if
