@@ -47,8 +47,9 @@ type eventPosition struct {
 }
 
 type supersessionResolver struct {
-	store datastore.HealthEventStore
-	until time.Time
+	holdContactSupport bool
+	store              datastore.HealthEventStore
+	until              time.Time
 }
 
 func newSupersessionResolver(
@@ -71,7 +72,7 @@ func (r *supersessionResolver) resolve(
 	createdAt time.Time,
 	documentID string,
 ) (bool, *eventCoverage, error) {
-	if createdAt.IsZero() || candidate.HealthEvent == nil {
+	if !r.needsHistory(candidate.HealthEvent, createdAt) {
 		return false, nil, nil
 	}
 
@@ -112,6 +113,14 @@ func (r *supersessionResolver) resolve(
 	}
 
 	return resolved, coverage, nil
+}
+
+func (r *supersessionResolver) needsHistory(event *protos.HealthEvent, createdAt time.Time) bool {
+	if createdAt.IsZero() || event == nil {
+		return false
+	}
+	// Later monitor samples cannot replace a fault that requires operator release.
+	return !r.holdContactSupport || event.IsHealthy || event.RecommendedAction != protos.RecommendedAction_CONTACT_SUPPORT
 }
 
 func (r *supersessionResolver) scanNewerEvents(

@@ -22,6 +22,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
+
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -193,7 +195,8 @@ func quarantineAnnotationIndexFunc(obj any) ([]string, error) {
 	_, cordonAnnotation := node.Annotations[common.QuarantineHealthEventIsCordonedAnnotationKey]
 	_, dryRun := node.Annotations[common.QuarantineHealthEventDryRunAnnotationKey]
 
-	if cordonAnnotation && node.Spec.Unschedulable && !dryRun {
+	held := cordonAnnotation || annotation.QuarantineValidationOwner(node) != ""
+	if node.Spec.Unschedulable && !dryRun && held {
 		return []string{"quarantined"}, nil
 	}
 

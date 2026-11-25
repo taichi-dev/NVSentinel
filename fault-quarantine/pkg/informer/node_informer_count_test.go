@@ -114,6 +114,23 @@ func requireGPUTotal(t *testing.T, ni *NodeInformer, want int) {
 	}, 10*time.Second, 10*time.Millisecond, "GPU node total never reached %d", want)
 }
 
+func TestValidationHandoffCountsTowardStandingLimit(t *testing.T) {
+	for _, tc := range []struct {
+		key, value string
+		held       bool
+	}{
+		{"nvsentinel.nvidia.com/quarantine-validation-request", "validation-a", true},
+		{"nvsentinel.nvidia.com/validation-session", `[{"name":"older","bootID":"boot-a"}]`, true},
+		{"nvsentinel.nvidia.com/validation-session", `[{"name":"onboarding"}]`, false},
+		{"other", "external", false},
+	} {
+		n := &v1.Node{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{tc.key: tc.value}}, Spec: v1.NodeSpec{Unschedulable: true}}
+		found, err := quarantineAnnotationIndexFunc(n)
+		require.NoError(t, err)
+		require.Equal(t, tc.held, len(found) == 1)
+	}
+}
+
 func TestGetNodeCounts_InitialListIsCountedBeforeSync(t *testing.T) {
 	ctx := t.Context()
 

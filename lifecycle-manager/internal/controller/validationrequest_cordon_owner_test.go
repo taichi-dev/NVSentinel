@@ -148,7 +148,10 @@ var _ = Describe("Validation release of a cordon NVSentinel did not apply", func
 		vr := reconcileUntilPhase(ctx, r, req, v1alpha1.PhaseRunning, maxReconcileIterations)
 		Expect(k8sClient.Delete(ctx, &vr)).To(Succeed())
 		reconcileForIterations(ctx, r, req, 1)
-		expectCordonKeptTaintReleased(nodeName)
+		node := getNode(ctx, nodeName)
+		Expect(node.Spec.Unschedulable).To(BeTrue())
+		Expect(node.Spec.Taints).To(ContainElement(HaveField("Key", Equal(cordonOwnerGateTaint.Key))))
+		Expect(node.Labels).To(HaveKeyWithValue(validationStateLabelKey, string(validationFailedLabelValue)))
 	})
 
 	for _, outcome := range []string{"success", "deletion"} {

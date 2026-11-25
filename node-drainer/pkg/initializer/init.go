@@ -201,6 +201,8 @@ func initializeKubeComponents(
 		return nil, fmt.Errorf("error while initializing informers: %w", err)
 	}
 
+	informersInstance.SetRequirePodTermination(tomlCfg.RequirePodTermination)
+
 	return &kubeComponents{
 		clientSet:     clientSet,
 		dynamicClient: dynamicClient,

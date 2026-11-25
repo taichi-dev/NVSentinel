@@ -21,6 +21,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
+
 	"github.com/google/cel-go/cel"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
@@ -47,7 +49,7 @@ import (
 
 const (
 	annotationActiveValidationRequest = "nvsentinel.nvidia.com/active-validation-request"
-	annotationValidationSession       = "nvsentinel.nvidia.com/validation-session"
+	annotationValidationSession       = annotation.ValidationSession
 	finalizerName                     = "nvsentinel.nvidia.com/validation-request"
 )
 

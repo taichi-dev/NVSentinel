@@ -69,6 +69,11 @@ rules:
   - resourceclaims
   verbs:
   - get
+{{- if .Values.requirePodTermination }}
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get"]
+{{- end }}
 {{- if .Values.customDrain.enabled }}
 - apiGroups:
   - {{ .Values.customDrain.apiGroup | quote }}

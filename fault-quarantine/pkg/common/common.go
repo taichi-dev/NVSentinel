@@ -14,7 +14,16 @@
 
 package common
 
-import "github.com/nvidia/nvsentinel/data-models/pkg/protos"
+import (
+	"errors"
+
+	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
+
+	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
+)
+
+// ErrRebootValidationPending keeps the final recovery replayable until the maintenance handoff succeeds.
+var ErrRebootValidationPending = errors.New("waiting for post-reboot validation handoff")
 
 // As part of the quarantineValidationHealthEvent annotation, we keep track of HealthEvents which contributed the
 // tests and the tests themselves. We will use the HealthEvent ID to check if the node was fully drained as part
@@ -22,6 +31,8 @@ import "github.com/nvidia/nvsentinel/data-models/pkg/protos"
 type HealthEventWithTests struct {
 	*protos.HealthEvent
 	Tests []string `json:"tests,omitempty"`
+	// Stored on the first retained event once a strict session reaches its history limit.
+	SessionTests []string `json:"sessionTests,omitempty"`
 }
 
 // RuleEvaluationResult represents the result of a rule evaluation
@@ -33,11 +44,13 @@ const (
 )
 
 const (
+	ContactSupportHold = "nvsentinel.nvidia.com/contact-support-hold"
+
 	// GPURecheckRequestKey identifies a one-shot, fresh monitor confirmation.
 	GPURecheckRequestKey = "gpuRecheckRequest"
 
 	// Annotation keys for storing event on node which causes node to be cordoned or tainted
-	QuarantineHealthEventAnnotationKey                    = "quarantineHealthEvent"
+	QuarantineHealthEventAnnotationKey                    = annotation.QuarantineHealthEvent
 	QuarantineHealthEventAppliedTaintsAnnotationKey       = "quarantineHealthEventAppliedTaints"
 	QuarantineHealthEventAppliedLabelsAnnotationKey       = "quarantineHealthEventAppliedLabels"
 	QuarantineHealthEventIsCordonedAnnotationKey          = "quarantineHealthEventIsCordoned"
@@ -74,6 +87,9 @@ const (
 // and fault-quarantine then concludes no quarantine is in progress and
 // re-cordons a node it has already handled.
 var QuarantineAnnotationKeys = []string{
+	ContactSupportHold,
+	annotation.QuarantineValidationRequest,
+	annotation.ValidationSession,
 	QuarantineHealthEventAnnotationKey,
 	QuarantineHealthEventAppliedTaintsAnnotationKey,
 	QuarantineHealthEventAppliedLabelsAnnotationKey,

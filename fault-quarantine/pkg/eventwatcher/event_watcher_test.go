@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -28,6 +29,7 @@ import (
 	"github.com/nvidia/nvsentinel/commons/pkg/eventutil"
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/coldstart"
+	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
 	"github.com/nvidia/nvsentinel/store-client/pkg/client"
 	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
 	"github.com/nvidia/nvsentinel/store-client/pkg/query"
@@ -750,6 +752,104 @@ func TestProcessEvent_LiveTransientFailureStillPersistsStatus(t *testing.T) {
 	require.ErrorIs(t, err, processingErr)
 	assert.Equal(t, 1, dbClient.updateCalls,
 		"withholding partial status is recovery-only and must not change the established live path")
+}
+
+func TestRebootRecoveryTransientFailurePreservesLiveReplay(t *testing.T) {
+	const id = "fault-a"
+	db := &databaseClientStub{}
+	stream := &changeStreamWatcherStub{}
+	w := NewEventWatcher(stream, db, time.Minute, &objectIDStoreStub{})
+	w.ConfigureRebootRecovery(true, &deferredRecoveryStore{})
+	event := &clientEventStub{document: storedHealthEvent(id), recordUUID: id, eventID: "52"}
+	status := model.AlreadyQuarantined
+	processingErr := errors.New("node API unavailable")
+	w.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+		return &status, processingErr
+	})
+
+	require.ErrorIs(t, w.processAndCheckpoint(t.Context(), event), processingErr)
+	require.Zero(t, stream.markCalls)
+	require.Zero(t, db.completionCalls)
+	require.Zero(t, db.updateCalls, "a partial status makes the event terminal on restart")
+
+	w.recoveryOverlapCutoff = time.Now()
+	w.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+		return &status, nil
+	})
+	require.NoError(t, w.processAndCheckpoint(t.Context(), event))
+	require.Equal(t, 1, db.countCalls)
+	require.Equal(t, id, db.updatedID)
+	require.Equal(t, 1, stream.markCalls)
+}
+
+func TestRecoveryWaitingForRebootPersistsBeforeCheckpoint(t *testing.T) {
+	for _, writeFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(writeFails), func(t *testing.T) {
+			doc := storedHealthEvent("recovery")
+			doc["healthevent"].(datastore.Event)["isHealthy"] = true
+			events := make(chan client.Event, 2)
+			events <- &clientEventStub{document: doc, eventID: "52", recordUUID: "recovery"}
+			events <- &clientEventStub{document: storedHealthEvent("fatal"), eventID: "53", recordUUID: "fatal"}
+			close(events)
+			var actions []string
+			stream := &changeStreamWatcherStub{events: events, actions: &actions}
+			db := &databaseClientStub{actions: &actions}
+			if writeFails {
+				db.completionErr = errors.New("store unavailable")
+			}
+			w := NewEventWatcher(stream, db, time.Minute, &objectIDStoreStub{})
+			w.SetProcessEventCallback(func(_ context.Context, event *model.HealthEventWithStatus) (*model.Status, error) {
+				if event.HealthEvent.IsHealthy {
+					return nil, common.ErrRebootValidationPending
+				}
+				status := model.Quarantined
+				return &status, nil
+			})
+			err := w.watchEvents(t.Context())
+			if writeFails {
+				require.ErrorIs(t, err, db.completionErr)
+				require.Zero(t, stream.markCalls)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []string{"complete", "checkpoint", "checkpoint"}, actions)
+			require.Equal(t, "awaitingReboot", db.completionValue)
+			require.Equal(t, "recovery", db.completionID)
+			require.Equal(t, "fatal", db.updatedID)
+		})
+	}
+}
+
+func TestRestartResumesDeferredHealthyWithoutNewLiveEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	rec := datastore.HealthEventWithStatus{CreatedAt: time.Now().Add(-48 * time.Hour), RawEvent: storedHealthEvent("old-healthy")}
+	rec.RawEvent["healthevent"].(datastore.Event)["isHealthy"] = true
+	store := &deferredRecoveryStore{record: rec}
+	db := &databaseClientStub{}
+	w := NewEventWatcher(&changeStreamWatcherStub{events: make(chan client.Event)}, db, time.Minute, &objectIDStoreStub{})
+	w.ConfigureRebootRecovery(true, store)
+	w.SetProcessEventCallback(func(context.Context, *model.HealthEventWithStatus) (*model.Status, error) {
+		cancel()
+		status := model.UnQuarantined
+		return &status, nil
+	})
+	require.NoError(t, w.watchEvents(ctx))
+	require.Equal(t, "old-healthy", db.updatedID)
+	require.Equal(t, 1, db.updateManyCalls)
+}
+
+type deferredRecoveryStore struct {
+	datastore.HealthEventStore
+	record datastore.HealthEventWithStatus
+}
+
+func (s *deferredRecoveryStore) FindHealthEventsByQueryBatched(_ context.Context, q datastore.QueryBuilder, _ int,
+	visit func([]datastore.HealthEventWithStatus) error) error {
+	if strings.Contains(fmt.Sprint(q.ToMongo()), coldstart.AwaitingRebootValue) {
+		return visit([]datastore.HealthEventWithStatus{s.record})
+	}
+	return nil
 }
 
 func TestWatchEvents_RecheckFailurePreservesReplay(t *testing.T) {

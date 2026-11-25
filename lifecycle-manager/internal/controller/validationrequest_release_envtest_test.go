@@ -595,6 +595,112 @@ var _ = Describe("Validation release readiness check", func() {
 		expectGateReleased(nodeName)
 	})
 
+	It("keeps the gate when a quarantine validation is deleted before passing", func() {
+		nodeName := "release-delete-quarantine"
+		fixture := newReleaseFixture("delete-quarantine", releaseFixtureOptions{}, nodeName)
+		vr := fixture.running()
+		vr.Annotations = map[string]string{"nvsentinel.nvidia.com/cordon-pre-existing": "false"}
+		Expect(k8sClient.Update(ctx, &vr)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, &vr)).To(Succeed())
+		_, err := fixture.reconciler.Reconcile(ctx, fixture.request)
+		Expect(err).NotTo(HaveOccurred())
+		expectGateRetained(nodeName)
+	})
+	It("keeps a deleted post-reboot validation pending after an unrelated request is also deleted", func() {
+		nodeName := "release-deleted-overlap"
+		f := newReleaseFixture("deleted-overlap", releaseFixtureOptions{}, nodeName)
+		vr := f.running()
+		vr.Annotations = map[string]string{"nvsentinel.nvidia.com/validation-boot-id": "boot-b"}
+		Expect(k8sClient.Update(ctx, &vr)).To(Succeed())
+		r, req := newValidationRequestTestSetup(ctx, "deleted-neighbor", validationRequestTestCase{config: f.config, spec: v1alpha1.ValidationRequestSpec{Nodes: []v1alpha1.NodeSpec{{Name: nodeName}}}})
+		other := reconcileForIterations(ctx, r, req, 3)
+		Expect(k8sClient.Delete(ctx, &vr)).To(Succeed())
+		_, err := f.reconciler.Reconcile(ctx, f.request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(k8sClient.Delete(ctx, &other)).To(Succeed())
+		_, err = r.Reconcile(ctx, req)
+		Expect(err).NotTo(HaveOccurred())
+		expectGateRetained(nodeName)
+	})
+	DescribeTable("releases a boot-bound request only after its requested test passes",
+		func(suffix string, skip bool) {
+			name := "release-bound-" + suffix
+			f := newReleaseFixture("bound-"+suffix, releaseFixtureOptions{skipTests: skip}, name)
+			node := getNode(ctx, name)
+			node.Status.NodeInfo.BootID = "boot-b"
+			Expect(k8sClient.Status().Update(ctx, &node)).To(Succeed())
+			var vr v1alpha1.ValidationRequest
+			Expect(k8sClient.Get(ctx, f.request.NamespacedName, &vr)).To(Succeed())
+			vr.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: name, UID: node.UID}}
+			vr.Annotations = map[string]string{"nvsentinel.nvidia.com/validation-boot-id": "boot-b"}
+			vr.Spec.Tests = []string{"basic"}
+			Expect(k8sClient.Update(ctx, &vr)).To(Succeed())
+			if skip {
+				vr = reconcileUntilPhase(ctx, f.reconciler, f.request, v1alpha1.PhaseFailed, maxReconcileIterations)
+				expectReleaseBlocked(vr, readinessViolation{node: name, criterion: "required-test-passed"})
+				expectGateRetained(name)
+				return
+			}
+			vr = f.running()
+			Expect(updateObjectStatusForAllTestGroups(ctx, &vr, testSuccessCondType)).To(Succeed())
+			reconcileUntilPhase(ctx, f.reconciler, f.request, v1alpha1.PhaseSucceeded, maxReconcileIterations)
+			expectGateReleased(name)
+		},
+		Entry("passed", "passed", false),
+		Entry("skipped", "skipped", true),
+	)
+
+	It("blocks boot-bound release when a fault arrives after tests", func() {
+		name := "refault-during-validation"
+		f := newReleaseFixture("refault", releaseFixtureOptions{}, name)
+		f.config.Validation.Spec.ReadinessCriteria = defaultTestConfig().Validation.Spec.ReadinessCriteria
+		node := getNode(ctx, name)
+		node.Status.NodeInfo.BootID = "boot-a"
+		Expect(k8sClient.Status().Update(ctx, &node)).To(Succeed())
+		var vr v1alpha1.ValidationRequest
+		Expect(k8sClient.Get(ctx, f.request.NamespacedName, &vr)).To(Succeed())
+		vr.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: name, UID: node.UID}}
+		vr.Spec.Tests = []string{"basic"}
+		vr.Annotations = map[string]string{"nvsentinel.nvidia.com/validation-boot-id": "boot-a"}
+		Expect(k8sClient.Update(ctx, &vr)).To(Succeed())
+		vr = f.running()
+		Expect(updateObjectStatusForAllTestGroups(ctx, &vr, testSuccessCondType)).To(Succeed())
+		fired := f.afterTestDeleted(func(context.Context) error {
+			node := getNode(ctx, name)
+			node.Annotations["quarantineHealthEvent"] = `[{"id":"new-fault"}]`
+			return k8sClient.Update(ctx, &node)
+		})
+		vr = f.reconcile()
+		Expect(*fired).To(BeTrue())
+		expectReleaseBlocked(vr, readinessViolation{node: name, criterion: "active-quarantine"})
+		expectGateRetained(name)
+	})
+
+	It("holds post-reboot validation before tests and checks the same boot during release", func() {
+		nodeName := "release-boot-change"
+		fixture := newReleaseFixture("boot-change", releaseFixtureOptions{}, nodeName)
+		var vr v1alpha1.ValidationRequest
+		Expect(k8sClient.Get(ctx, fixture.request.NamespacedName, &vr)).To(Succeed())
+		node := getNode(ctx, nodeName)
+		vr.OwnerReferences = []metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: nodeName, UID: node.UID}}
+		vr.Annotations = map[string]string{"nvsentinel.nvidia.com/validation-boot-id": "boot-b"}
+		Expect(k8sClient.Update(ctx, &vr)).To(Succeed())
+		vr = reconcileForIterations(ctx, fixture.reconciler, fixture.request, 5)
+		Expect(vr.Status.Phase).To(Equal(v1alpha1.PhasePending))
+		setBoot := func(id string) {
+			n := getNode(ctx, nodeName)
+			n.Status.NodeInfo.BootID = id
+			Expect(k8sClient.Status().Update(ctx, &n)).To(Succeed())
+		}
+		setBoot("boot-b")
+		vr = fixture.running()
+		Expect(updateObjectStatusForAllTestGroups(ctx, &vr, testSuccessCondType)).To(Succeed())
+		fired := fixture.afterTestDeleted(func(context.Context) error { setBoot("boot-c"); return nil })
+		vr = fixture.reconcile()
+		Expect(*fired).To(BeTrue())
+		expectReleaseBlocked(vr, readinessViolation{node: nodeName, criterion: "validated-boot"})
+		expectGateRetained(nodeName)
+	})
 	It("releases the gate when the last request is deleted and the node is ready", func() {
 		nodeName := "release-delete-ready-node"
 		fixture := newReleaseFixture("release-delete-ready", releaseFixtureOptions{}, nodeName)

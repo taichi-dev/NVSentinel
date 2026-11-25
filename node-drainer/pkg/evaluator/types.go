@@ -43,6 +43,7 @@ type NodeDrainEvaluator struct {
 }
 
 type InformersInterface interface {
+	VerifyLiveDrain(context.Context, string, *protos.Entity, []config.UserNamespace, *config.PodPolicyMatcher) error
 	GetNamespacesMatchingPattern(context.Context, string, string, string) ([]string, error)
 	CheckIfAllPodsAreEvictedInImmediateMode(context.Context, []string, string, time.Duration,
 		*protos.Entity, ...informers.PodFilter) bool

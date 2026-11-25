@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -124,12 +125,41 @@ func (c *FaultQuarantineClient) CreateValidationRequestResource(ctx context.Cont
 		return nil
 	}
 
-	_, err := c.DynamicClient.Resource(gvr).Create(ctx, obj, metav1.CreateOptions{})
+	resources := c.DynamicClient.Resource(gvr)
+
+	_, err := resources.Create(ctx, obj, metav1.CreateOptions{})
+	if errors.IsAlreadyExists(err) && obj.GetAnnotations()[annotationutil.ValidationBootID] != "" {
+		existing, getErr := resources.Get(ctx, obj.GetName(), metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("read existing validation request: %w", getErr)
+		}
+
+		if !sameValidationEvidence(existing, obj) {
+			return fmt.Errorf("existing validation request %s does not match the maintenance handoff", obj.GetName())
+		}
+	}
+
 	if err != nil && !errors.IsAlreadyExists(err) {
 		return fmt.Errorf("failed to create ValidationRequest %s: %w", obj.GetName(), err)
 	}
 
 	return nil
+}
+
+func sameValidationEvidence(a, b *unstructured.Unstructured) bool {
+	if a.GetDeletionTimestamp() != nil || !reflect.DeepEqual(a.Object["spec"], b.Object["spec"]) ||
+		!reflect.DeepEqual(a.GetOwnerReferences(), b.GetOwnerReferences()) {
+		return false
+	}
+
+	keys := []string{annotationutil.ValidationBootID, annotationutil.RebootUID, annotationutil.CordonPreExisting}
+	for _, key := range keys {
+		if a.GetAnnotations()[key] != b.GetAnnotations()[key] {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (c *FaultQuarantineClient) EnsureCircuitBreakerConfigMap(ctx context.Context,
@@ -200,31 +230,39 @@ func (c *FaultQuarantineClient) SetLabelKeys(cordonedReasonKey, uncordonedReason
 }
 
 func (c *FaultQuarantineClient) UpdateNode(ctx context.Context, nodeName string, updateFn func(*v1.Node) error) error {
+	return c.updateNode(ctx, nodeName, updateFn, false)
+}
+
+// UpdateQuarantineNode reads the live session before changing a real quarantine.
+// A newly written dry-run marker may still be missing from the informer.
+func (c *FaultQuarantineClient) UpdateQuarantineNode(
+	ctx context.Context, nodeName string, updateFn func(*v1.Node) error,
+) error {
+	return c.updateNode(ctx, nodeName, updateFn, !c.DryRunMode)
+}
+
+func (c *FaultQuarantineClient) updateNode(
+	ctx context.Context, nodeName string, updateFn func(*v1.Node) error, readLive bool,
+) error {
 	mu, _ := c.operationMutex.LoadOrStore(nodeName, &sync.Mutex{})
 	mu.(*sync.Mutex).Lock()
 
 	defer mu.(*sync.Mutex).Unlock()
 
-	cached := c.cachedNodeForPatch(nodeName)
-	if guard, ok := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error); ok {
-		cached = nil // A recheck guard needs all current labels and annotations.
-		mutate := updateFn
-		updateFn = func(node *v1.Node) error {
-			if err := guard(node); err != nil {
-				return err
-			}
+	nodes := c.Clientset.CoreV1().Nodes()
 
-			return mutate(node)
-		}
+	var (
+		changed bool
+		err     error
+	)
+
+	guard, _ := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error)
+	if readLive || guard != nil {
+		changed, err = c.nodePatcher.PatchGuarded(ctx, nodes, nodeName, guard, updateFn)
+	} else {
+		changed, err = c.nodePatcher.Patch(ctx, nodes, nodeName, c.cachedNodeForPatch(nodeName), updateFn)
 	}
 
-	changed, err := c.nodePatcher.Patch(
-		ctx,
-		c.Clientset.CoreV1().Nodes(),
-		nodeName,
-		cached,
-		updateFn,
-	)
 	if err != nil {
 		return err
 	}
@@ -388,7 +426,8 @@ func (c *FaultQuarantineClient) QuarantineNodeAndSetAnnotations(
 		return nil
 	}
 
-	err := c.UpdateNode(ctx, nodename, updateFn)
+	readLive := !c.DryRunMode && annotations[common.QuarantineHealthEventAnnotationKey] != ""
+	err := c.updateNode(ctx, nodename, updateFn, readLive)
 
 	return alreadyQuarantined, err
 }
@@ -956,6 +995,16 @@ type nodeGuardContextKey struct{}
 func WithNodeGuard(ctx context.Context, guard func(*v1.Node) error) context.Context {
 	if guard == nil {
 		return ctx
+	}
+
+	if previous, ok := ctx.Value(nodeGuardContextKey{}).(func(*v1.Node) error); ok {
+		return context.WithValue(ctx, nodeGuardContextKey{}, func(node *v1.Node) error {
+			if err := previous(node); err != nil {
+				return err
+			}
+
+			return guard(node)
+		})
 	}
 
 	return context.WithValue(ctx, nodeGuardContextKey{}, guard)

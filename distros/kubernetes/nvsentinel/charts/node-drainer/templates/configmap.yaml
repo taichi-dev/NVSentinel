@@ -29,6 +29,7 @@ data:
     deleteAfterTimeoutMinutes = {{ .Values.deleteAfterTimeoutMinutes }}
     notReadyTimeoutMinutes = {{ .Values.notReadyTimeoutMinutes }}
     drainGPUPods = {{ .Values.drainGPUPods }}
+    requirePodTermination = {{ .Values.requirePodTermination }}
     {{- $global := .Values.global | default dict }}
     partialDrainEnabled = {{ if and (hasKey $global "partialDrainEnabled") (not (kindIs "invalid" (index $global "partialDrainEnabled"))) }}{{ $global.partialDrainEnabled }}{{ else }}{{ .Values.partialDrainEnabled }}{{ end }}
     partialDrainEntityMetricEnabled = {{ .Values.partialDrainEntityMetricEnabled | default false }}

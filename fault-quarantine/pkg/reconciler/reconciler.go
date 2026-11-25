@@ -135,6 +135,8 @@ var (
 	errQuarantinedNodeNotUpdated = errors.New("quarantined node was not updated")
 
 	manualUnquarantineAnnotationKeys = []string{
+		common.ContactSupportHold,
+		annotationutil.QuarantineValidationRequest,
 		common.QuarantineHealthEventAppliedTaintsAnnotationKey,
 		common.QuarantineHealthEventAnnotationKey,
 		common.QuarantineHealthEventIsCordonedAnnotationKey,
@@ -235,12 +237,15 @@ func (r *Reconciler) Start(ctx context.Context) error {
 	}
 
 	// Create event watcher with the new signature
-	r.eventWatcher = eventwatcher.NewEventWatcher(
+	watcher := eventwatcher.NewEventWatcher(
 		oldWatcher,
 		databaseClient,
 		time.Second*30, // 30 second metric update interval
 		r,              // Reconciler implements LastProcessedObjectIDStore interface
 	)
+
+	watcher.ConfigureRebootRecovery(r.config.TomlConfig.WaitForReboot(), ds.HealthEventStore())
+	r.eventWatcher = watcher
 
 	r.SetupNodeInformerCallbacks()
 
@@ -353,6 +358,7 @@ func (r *Reconciler) configureColdStart(
 		coldStartUntil := time.Now().UTC()
 
 		if err := coldstart.Handle(ctx, coldstart.Dependencies{
+			HoldContactSupport: r.config.TomlConfig.HoldContactSupport,
 			HealthEventStore:   healthEventStore,
 			EventProcessor:     r.eventWatcher,
 			ColdStartAfterTime: effectiveColdStartAfter,
@@ -529,7 +535,8 @@ func (r *Reconciler) initializeQuarantineMetrics(ctx context.Context) {
 // Returns error if retry exhaustion occurs (should restart pod)
 // Blocks indefinitely if circuit breaker is tripped (wait for manual intervention)
 func (r *Reconciler) checkCircuitBreakerAtStartup(ctx context.Context) error {
-	if !r.breakerActive() {
+	// In recovery mode each new isolation checks the breaker at admission.
+	if !r.breakerActive() || r.config.TomlConfig.CircuitBreaker.AllowRecovery {
 		return nil
 	}
 
@@ -641,7 +648,7 @@ func (r *Reconciler) ProcessEvent(
 func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context) (bool, error) {
 	span := tracing.SpanFromContext(ctx)
 
-	if !r.breakerActive() {
+	if !r.breakerActive() || r.config.TomlConfig.CircuitBreaker.AllowRecovery {
 		return false, nil
 	}
 
@@ -683,6 +690,56 @@ func (r *Reconciler) checkCircuitBreakerAndHalt(ctx context.Context) (bool, erro
 	return false, nil
 }
 
+// At capacity, keep tracking faults on cordoned nodes without starting a new quarantine.
+func (r *Reconciler) allowIsolation(ctx context.Context, event *protos.HealthEvent,
+	existing bool, node *corev1.Node) (context.Context, bool, error) {
+	if owner := r.continuingValidation(event, existing, node); owner != "" {
+		return informer.WithNodeGuard(ctx, func(live *corev1.Node) error {
+			if !live.Spec.Unschedulable || annotationutil.QuarantineValidationOwner(live) != owner {
+				return fmt.Errorf("validation no longer holds the cordon on node %s", live.Name)
+			}
+
+			return nil
+		}), true, nil
+	}
+
+	if !r.breakerActive() || !r.config.TomlConfig.CircuitBreaker.AllowRecovery || event.IsHealthy {
+		return ctx, true, nil
+	}
+
+	tripped, err := r.cb.IsTripped(ctx)
+	if err != nil {
+		return ctx, false, fmt.Errorf("check circuit breaker: %w", err)
+	}
+
+	if !tripped {
+		return ctx, true, nil
+	}
+
+	if !existing {
+		slog.WarnContext(ctx, "Circuit breaker suppressed new quarantine", "node", event.NodeName)
+		return ctx, false, nil
+	}
+
+	return informer.WithNodeGuard(ctx, requireCordonedSession), true, nil
+}
+
+func (r *Reconciler) continuingValidation(event *protos.HealthEvent, existing bool, node *corev1.Node) string {
+	if !existing && !event.IsHealthy && node.Spec.Unschedulable && r.config.TomlConfig.Validation.RequireCompletedReboot {
+		return annotationutil.QuarantineValidationOwner(node)
+	}
+
+	return ""
+}
+
+func requireCordonedSession(node *corev1.Node) error {
+	if !node.Spec.Unschedulable || node.Annotations[common.QuarantineHealthEventAnnotationKey] == "" {
+		return fmt.Errorf("circuit breaker requires existing cordoned quarantine")
+	}
+
+	return nil
+}
+
 //nolint:cyclop // Coordinates distinct quarantine branches; helpers own the detailed operations.
 func (r *Reconciler) handleEvent(
 	ctx context.Context,
@@ -693,7 +750,7 @@ func (r *Reconciler) handleEvent(
 	ctx, span := tracing.StartSpan(ctx, "fault_quarantine.handle_event")
 	defer span.End()
 
-	annotations, quarantineAnnotationExists, err := r.hasExistingQuarantine(ctx, event.HealthEvent.NodeName)
+	node, quarantineAnnotationExists, err := r.hasExistingQuarantine(ctx, event.HealthEvent.NodeName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to determine existing node quarantine",
 			"node", event.HealthEvent.NodeName, "error", err)
@@ -701,10 +758,17 @@ func (r *Reconciler) handleEvent(
 		return nil, err
 	}
 
+	ctx, allowed, err := r.allowIsolation(ctx, event.HealthEvent, quarantineAnnotationExists, node)
+	if err != nil || !allowed {
+		return nil, err
+	}
+
 	if quarantineAnnotationExists {
 		slog.DebugContext(ctx, "Node already has active quarantine annotation, skipping fresh quarantine",
 			"node", event.HealthEvent.NodeName,
 			"checkName", event.HealthEvent.CheckName)
+
+		ctx = r.guardExternalQuarantine(ctx, event.HealthEvent, node)
 
 		return r.handleAlreadyQuarantinedNode(ctx, event.HealthEvent, ruleSetEvals, rulesetsConfig)
 	}
@@ -753,7 +817,7 @@ func (r *Reconciler) handleEvent(
 	taintsToBeApplied := r.collectTaintsToApply(taintAppliedMap)
 	labelsToBeApplied := collectLabelsToApply(&appliedLabelsMap)
 
-	node, err := r.getNode(ctx, event.HealthEvent.NodeName)
+	node, err = r.getNode(ctx, event.HealthEvent.NodeName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get node", "node", event.HealthEvent.NodeName, "error", err)
 		metrics.ProcessingErrors.WithLabelValues("get_node_error").Inc()
@@ -781,7 +845,7 @@ func (r *Reconciler) handleEvent(
 	}
 
 	status, quarantineErr := r.applyQuarantine(
-		ctx, event, annotations, taintsToBeApplied, labelsToBeApplied,
+		ctx, event, node.Annotations, taintsToBeApplied, labelsToBeApplied,
 		annotationsMap, &labelsMap, &isCordoned,
 	)
 
@@ -802,19 +866,13 @@ func recoveryEffectFilter(ctx context.Context) func(healthEventsAnnotation.Healt
 func (r *Reconciler) hasExistingQuarantine(
 	ctx context.Context,
 	nodeName string,
-) (map[string]string, bool, error) {
-	annotations, err := r.getNodeQuarantineAnnotations(ctx, nodeName)
+) (*corev1.Node, bool, error) {
+	node, err := r.getNode(ctx, nodeName)
 	if err != nil {
-		return nil, false, fmt.Errorf("failed to fetch annotations for node %s: %w", nodeName, err)
+		return nil, false, fmt.Errorf("read quarantine on node %s: %w", nodeName, err)
 	}
 
-	if annotations == nil {
-		return make(map[string]string), false, nil
-	}
-
-	annotationVal, exists := annotations[common.QuarantineHealthEventAnnotationKey]
-
-	return annotations, exists && !isEmptyHealthEventAnnotation(annotationVal), nil
+	return node, !isEmptyHealthEventAnnotation(node.Annotations[common.QuarantineHealthEventAnnotationKey]), nil
 }
 
 func isEmptyHealthEventAnnotation(annotationVal string) bool {
@@ -867,7 +925,12 @@ func (r *Reconciler) handleAlreadyQuarantinedNode(
 
 	// As when the first quarantine fails, write no status, so that cold start replays the event and applies it
 	// again. A replay is safe: the event is skipped where it is already tracked or its actions already applied.
-	if errors.Is(processingErr, errQuarantinedNodeNotUpdated) {
+	if r.config.TomlConfig.RequireExternalRebootReceipt && event.IsHealthy && processingErr != nil {
+		return nil, errors.Join(common.ErrRebootValidationPending, eligibilityErr, processingErr)
+	}
+
+	if errors.Is(processingErr, errQuarantinedNodeNotUpdated) ||
+		errors.Is(processingErr, common.ErrRebootValidationPending) {
 		return nil, errors.Join(eligibilityErr, processingErr)
 	}
 
@@ -1312,6 +1375,8 @@ func (r *Reconciler) applyQuarantine(
 		annotationsMap[common.QuarantineHealthEventDryRunAnnotationKey] = common.QuarantineHealthEventDryRunAnnotationValue
 	}
 
+	r.recordSupportHold(annotationsMap, event.HealthEvent, healthEvents)
+
 	if err := r.addHealthEventAnnotation(healthEvents, annotationsMap); err != nil {
 		slog.ErrorContext(ctx, "Failed to add health event annotation", "error", err, "node", event.HealthEvent.NodeName)
 		tracing.RecordError(span, err)
@@ -1421,7 +1486,7 @@ func (r *Reconciler) breakerActive() bool {
 // recordCordonEventInCircuitBreaker records a cordon event in the circuit breaker if enabled
 func (r *Reconciler) recordCordonEventInCircuitBreaker(event *model.HealthEventWithStatus) {
 	if r.breakerActive() &&
-		(event.HealthEvent.QuarantineOverrides == nil || !event.HealthEvent.QuarantineOverrides.Force) {
+		(r.config.TomlConfig.CircuitBreaker.AllowRecovery || !r.isForceQuarantine(event.HealthEvent)) {
 		r.cb.AddCordonEvent(event.HealthEvent.NodeName)
 	}
 }
@@ -1498,6 +1563,34 @@ func (r *Reconciler) isForceQuarantine(event *protos.HealthEvent) bool {
 	return event.QuarantineOverrides != nil && event.QuarantineOverrides.Force
 }
 
+func (r *Reconciler) holdForSupport(event *protos.HealthEvent) bool {
+	return r.config.TomlConfig.HoldContactSupport &&
+		event.GetRecommendedAction() == protos.RecommendedAction_CONTACT_SUPPORT
+}
+
+func (r *Reconciler) recordSupportHold(annotations map[string]string, event *protos.HealthEvent,
+	tracked *healthEventsAnnotation.HealthEventsAnnotationMap) {
+	if r.holdForSupport(event) || (r.config.TomlConfig.HoldContactSupport && containsSupportEvent(tracked)) {
+		annotations[common.ContactSupportHold] = "true"
+	}
+}
+
+func (r *Reconciler) supportHoldActive(annotations map[string]string,
+	tracked *healthEventsAnnotation.HealthEventsAnnotationMap) bool {
+	return r.config.TomlConfig.HoldContactSupport &&
+		(annotations[common.ContactSupportHold] == "true" || containsSupportEvent(tracked))
+}
+
+func containsSupportEvent(events *healthEventsAnnotation.HealthEventsAnnotationMap) bool {
+	for _, event := range events.Events {
+		if event.GetRecommendedAction() == protos.RecommendedAction_CONTACT_SUPPORT {
+			return true
+		}
+	}
+
+	return false
+}
+
 // handleUnhealthyEventOnQuarantinedNode handles unhealthy events on already-quarantined nodes
 func (r *Reconciler) handleUnhealthyEventOnQuarantinedNode(
 	ctx context.Context,
@@ -1523,7 +1616,7 @@ func (r *Reconciler) handleUnhealthyEventOnQuarantinedNode(
 
 	added := healthEventsAnnotationMap.AddOrUpdateEventFiltered(event, recoveryEffectFilter(ctx))
 
-	if added {
+	if added || r.holdForSupport(event) || r.config.TomlConfig.WaitForReboot() {
 		slog.InfoContext(ctx, "Added entity failures for check on node",
 			"checkName", event.CheckName, "node", event.NodeName, "totalTrackedEntities", healthEventsAnnotationMap.Count())
 
@@ -1853,6 +1946,10 @@ func (r *Reconciler) handleQuarantinedNode(
 		)
 	}
 
+	if r.supportHoldActive(annotations, healthEventsAnnotationMap) {
+		return true, nil
+	}
+
 	if !hasExistingCheck {
 		slog.DebugContext(ctx, "Received healthy event for untracked check (other checks may still be failing)",
 			"check", event.CheckName,
@@ -2010,9 +2107,14 @@ func (r *Reconciler) addEventToAnnotation(
 			}
 		}
 
+		r.recordSupportHold(node.Annotations, event, healthEventsMap)
+
 		added := healthEventsMap.AddOrUpdateEventFiltered(event, recoveryEffectFilter(ctx))
 		if !added {
-			slog.DebugContext(ctx, "Event already exists for node, no annotation update needed", "node", event.NodeName)
+			// A distinct fatal document can invalidate the maintenance receipt even for the same GPU and action.
+			if r.config.TomlConfig.WaitForReboot() {
+				return r.updateValidationAnnotation(ctx, node.Annotations, event)
+			}
 
 			return nil
 		}
@@ -2033,7 +2135,7 @@ func (r *Reconciler) addEventToAnnotation(
 		return r.updateValidationAnnotation(ctx, node.Annotations, event)
 	}
 
-	return r.k8sClient.UpdateNode(ctx, event.NodeName, updateFn)
+	return r.k8sClient.UpdateQuarantineNode(ctx, event.NodeName, updateFn)
 }
 
 // updateValidationAnnotation adds or updates a HealthEvent to the node's quarantineValidationHealthEvent if
@@ -2170,7 +2272,7 @@ func (r *Reconciler) performUncordon(
 	}
 
 	annotationsToBeRemoved = appendIfPresent(annotations, annotationsToBeRemoved,
-		common.QuarantineHealthEventAnnotationKey, common.QuarantineHealthEventDryRunAnnotationKey)
+		common.QuarantineHealthEventAnnotationKey, common.QuarantineHealthEventDryRunAnnotationKey, common.ContactSupportHold)
 
 	if len(taintsToBeRemoved) == 0 && len(ruleLabelsToRemove) == 0 && !isUnCordon && len(annotationsToBeRemoved) == 0 {
 		span.SetAttributes(attribute.String("fault_quarantine.event.processing_status", EventProcessingStatusSkipped),
@@ -2179,6 +2281,8 @@ func (r *Reconciler) performUncordon(
 
 		return false, nil
 	}
+
+	ctx = r.guardExternalReceipt(ctx)
 
 	annotationsToBeRemoved, taintsToBeRemoved, isUnCordon, validationRequestCreated, err :=
 		r.triggerValidationOnUnquarantine(ctx, span, event, annotations, annotationsToBeRemoved, taintsToBeRemoved,
@@ -2224,6 +2328,42 @@ func (r *Reconciler) performUncordon(
 	return false, nil
 }
 
+// A healthy event must not clear a newer fault, including another report for the same GPU.
+func (r *Reconciler) guardExternalQuarantine(ctx context.Context, event *protos.HealthEvent,
+	snapshot *corev1.Node) context.Context {
+	if !event.IsHealthy || !r.config.TomlConfig.RequireExternalRebootReceipt {
+		return ctx
+	}
+
+	return informer.WithNodeGuard(ctx, func(node *corev1.Node) error {
+		if node.UID != snapshot.UID {
+			return fmt.Errorf("%w: node %s was replaced", common.ErrRebootValidationPending, node.Name)
+		}
+
+		for _, key := range common.QuarantineAnnotationKeys {
+			if snapshot.Annotations[key] != node.Annotations[key] {
+				return fmt.Errorf("%w: quarantine changed on node %s", common.ErrRebootValidationPending, node.Name)
+			}
+		}
+
+		return nil
+	})
+}
+
+func (r *Reconciler) guardExternalReceipt(ctx context.Context) context.Context {
+	if !r.config.TomlConfig.RequireExternalRebootReceipt {
+		return ctx
+	}
+
+	return informer.WithNodeGuard(ctx, func(node *corev1.Node) error {
+		if err := r.validationClient.CheckExternalRebootReceipt(ctx, node); err != nil {
+			return errors.Join(common.ErrRebootValidationPending, err)
+		}
+
+		return nil
+	})
+}
+
 func (r *Reconciler) buildUncordonLabelsToRemove(ruleLabelsToRemove []config.Label,
 	validationRequestCreated bool) []string {
 	labelsToRemove := []string{statemanager.NVSentinelStateLabelKey}
@@ -2254,8 +2394,17 @@ func (r *Reconciler) triggerValidationOnUnquarantine(ctx context.Context, span t
 		return annotationsToBeRemoved, taintsToBeRemoved, isUnCordon, false, nil
 	}
 
+	if r.config.TomlConfig.RequireExternalRebootReceipt {
+		return append(annotationsToBeRemoved, common.QuarantineValidationHealthEventAnnotationKey),
+			taintsToBeRemoved, isUnCordon, false, nil
+	}
+
 	validationRequestCreated, err := r.createValidationRequestIfRequested(ctx, event, annotations)
 	if err != nil {
+		if r.config.TomlConfig.Validation.RequireCompletedReboot {
+			err = errors.Join(common.ErrRebootValidationPending, err)
+		}
+
 		slog.ErrorContext(ctx, "Failed to create ValidationRequest for node, keeping node quarantined",
 			"node", event.NodeName, "error", err)
 		metrics.ProcessingErrors.WithLabelValues("create_validation_request_error").Inc()
@@ -2297,6 +2446,10 @@ func (r *Reconciler) createValidationRequestIfRequested(ctx context.Context, eve
 	}
 
 	if len(tests) == 0 {
+		if r.config.TomlConfig.Validation.RequireCompletedReboot {
+			return false, fmt.Errorf("missing tests for reboot validation")
+		}
+
 		return false, nil
 	}
 
@@ -2446,12 +2599,13 @@ func (r *Reconciler) getNodeQuarantineAnnotations(ctx context.Context, nodeName 
 // getNode bypasses the informer during recovery so reconciliation uses current node state.
 // A node deleted before replay is a permanent event error.
 func (r *Reconciler) getNode(ctx context.Context, nodeName string) (*corev1.Node, error) {
-	if coldstart.IsRecoveryContext(ctx) {
+	if coldstart.IsRecoveryContext(ctx) || r.config.TomlConfig.WaitForReboot() ||
+		r.config.TomlConfig.HoldContactSupport {
 		node, err := coldstart.GetRecoveryNode(ctx, nodeName, func() (*corev1.Node, error) {
 			return r.k8sClient.Clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		})
 		if err != nil {
-			wrappedErr := fmt.Errorf("failed to get node from API server during cold start: %w", err)
+			wrappedErr := fmt.Errorf("failed to get node from API server: %w", err)
 			if apierrors.IsNotFound(err) {
 				return nil, coldstart.PermanentError(wrappedErr)
 			}

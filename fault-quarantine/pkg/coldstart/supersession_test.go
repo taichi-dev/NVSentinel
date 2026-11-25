@@ -413,7 +413,7 @@ func TestRecoverStoredEvent_ProjectsResidualBeforeRuleEvaluation(t *testing.T) {
 			}}
 			completion, err := recoverStoredEvent(
 				context.Background(), newSupersessionResolver(store, base.Add(time.Hour)), processor,
-				parseStoredRecoveryEvent(failure))
+				parseStoredRecoveryEvent(failure), false)
 			require.NoError(t, err)
 			assert.Nil(t, completion)
 			require.Len(t, projected, len(tt.expected))
@@ -560,4 +560,25 @@ func TestSupersessionResolver_CheckWideRecoveryAfterEntityUpdate_KeepsRecovery(t
 		t, newSupersessionResolver(store, base.Add(time.Hour)), checkWideRecovery)
 	require.NoError(t, err)
 	assert.False(t, superseded)
+}
+
+func TestDeferredRebootRecoveryRechecksSupersessionAfterRestart(t *testing.T) {
+	base := time.Now().Add(-48 * time.Hour)
+	for _, refault := range []bool{false, true} {
+		store := &latestEventStoreStub{}
+		waiting := withErrorCodes(recoveryRecord(base, true, []any{impactedEntity("0")}), "79")
+		if refault {
+			newer := withErrorCodes(recoveryRecord(base.Add(time.Hour), false, []any{impactedEntity("0")}), "79")
+			newer.RawEvent["id"] = "refault"
+			store.events = []datastore.HealthEventWithStatus{newer}
+		}
+		calls := 0
+		processor := &eventProcessorStub{process: func(context.Context, model.HealthEventWithStatus, string) (ProcessResult, error) {
+			calls++
+			return ProcessResultProcessed, nil
+		}}
+		require.NoError(t, RetryRebootRecovery(t.Context(), store, processor, waiting))
+		require.Equal(t, !refault, calls == 1)
+		require.Equal(t, [][]string{{"event-id"}}, processor.completionBatches)
+	}
 }

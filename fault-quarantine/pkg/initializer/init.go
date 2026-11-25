@@ -35,14 +35,15 @@ import (
 )
 
 type InitializationParams struct {
-	KubeconfigPath              string
-	TomlConfigPath              string
-	DryRun                      bool
-	CircuitBreakerEnabled       bool
-	DatabaseClientCertMountPath string
-	GPUNodeLabelKey             string
-	GPUNodeLabelValue           string
-	KubernetesClientRateLimits  kubeclient.RateLimitConfig
+	RequireExternalRebootReceipt bool
+	KubeconfigPath               string
+	TomlConfigPath               string
+	DryRun                       bool
+	CircuitBreakerEnabled        bool
+	DatabaseClientCertMountPath  string
+	GPUNodeLabelKey              string
+	GPUNodeLabelValue            string
+	KubernetesClientRateLimits   kubeclient.RateLimitConfig
 }
 
 type Components struct {
@@ -74,6 +75,10 @@ func InitializeAll(ctx context.Context, params InitializationParams) (*Component
 	var tomlCfg config.TomlConfig
 	if err := configmanager.LoadTOMLConfig(params.TomlConfigPath, &tomlCfg); err != nil {
 		return nil, fmt.Errorf("error while loading the toml config: %w", err)
+	}
+
+	if err := tomlCfg.ValidateExternalRebootReceipt(params.RequireExternalRebootReceipt); err != nil {
+		return nil, err
 	}
 
 	if params.DryRun {

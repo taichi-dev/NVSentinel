@@ -27,12 +27,14 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
@@ -41,9 +43,11 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
+	"github.com/nvidia/nvsentinel/commons/pkg/annotation"
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
 	"github.com/nvidia/nvsentinel/data-models/pkg/protos"
 	"github.com/nvidia/nvsentinel/fault-quarantine/pkg/common"
+	"github.com/nvidia/nvsentinel/node-drainer/pkg/config"
 	"github.com/nvidia/nvsentinel/node-drainer/pkg/metrics"
 )
 
@@ -60,11 +64,19 @@ type Informers struct {
 	clientset              kubernetes.Interface
 	notReadyTimeoutMinutes *int
 	drainGPUPods           bool
+	requirePodTermination  bool
+	systemNamespaces       *regexp.Regexp
 	dryRunMode             []string
 }
 
 // PodFilter narrows an action to pods assigned to its drain mode.
 type PodFilter func(*v1.Pod) bool
+
+// SetRequirePodTermination configures native drains to wait for pod termination.
+// Call this before starting the informers.
+func (i *Informers) SetRequirePodTermination(required bool) {
+	i.requirePodTermination = required
+}
 
 // NewInformers creates the pod and node informers used to observe drainable workloads.
 // The pod cache retains only the labels named by podLabelKeys, and the node cache only
@@ -111,6 +123,7 @@ func NewInformers(clientset kubernetes.Interface, resyncPeriod time.Duration,
 
 	return &Informers{
 		clientset:        clientset,
+		systemNamespaces: systemNamespacesRegex,
 		podInformer:      podInformer,
 		nodeInformer:     nodeInformer,
 		eventBroadcaster: eventBroadcaster,
@@ -378,6 +391,111 @@ func (i *Informers) FindEvictablePodsInNamespaceAndNode(ctx context.Context, nam
 		}
 	}
 
+	return i.filterDrainScope(ctx, pods, partialDrainEntity, nodeName)
+}
+
+// VerifyLiveDrain takes one API snapshot across every namespace immediately before success.
+func (i *Informers) VerifyLiveDrain(ctx context.Context, nodeName string, entity *protos.Entity,
+	namespaces []config.UserNamespace, policies *config.PodPolicyMatcher) error {
+	selector := fields.OneTermEqualSelector("spec.nodeName", nodeName)
+
+	list, err := i.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: selector.String()})
+	if err != nil {
+		return fmt.Errorf("list pods: %w", err)
+	}
+
+	var selected []*v1.Pod
+
+	for idx := range list.Items {
+		pod := &list.Items[idx]
+
+		matches, err := i.inDrainScope(pod, namespaces, policies)
+		if err != nil {
+			return err
+		}
+
+		if matches {
+			selected = append(selected, pod)
+		}
+	}
+
+	remaining, err := i.filterDrainScope(ctx, selected, entity, nodeName)
+	if err != nil {
+		return err
+	}
+
+	if len(remaining) != 0 {
+		return fmt.Errorf("waiting for %d eligible pods", len(remaining))
+	}
+
+	return i.verifyKubeletHeartbeat(ctx, nodeName)
+}
+
+func (i *Informers) inDrainScope(pod *v1.Pod, namespaces []config.UserNamespace,
+	policies *config.PodPolicyMatcher) (bool, error) {
+	if i.systemNamespaces != nil && i.systemNamespaces.MatchString(pod.Namespace) {
+		return false, nil
+	}
+
+	if len(namespaces) == 0 {
+		_, matched := policies.Match(pod)
+		return matched, nil
+	}
+
+	for _, ns := range namespaces {
+		matches, err := filepath.Match(ns.Name, pod.Namespace)
+		if err != nil {
+			return false, fmt.Errorf("match namespace %q: %w", ns.Name, err)
+		}
+
+		if matches {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func (i *Informers) verifyKubeletHeartbeat(ctx context.Context, nodeName string) error {
+	node, err := i.clientset.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read node readiness: %w", err)
+	}
+
+	ready := slices.ContainsFunc(node.Status.Conditions, func(c v1.NodeCondition) bool {
+		return c.Type == v1.NodeReady && c.Status == v1.ConditionTrue
+	})
+	if !ready || node.DeletionTimestamp != nil {
+		return fmt.Errorf("node %s is not Ready", nodeName)
+	}
+
+	lease, err := i.clientset.CoordinationV1().Leases("kube-node-lease").Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("read kubelet heartbeat: %w", err)
+	}
+
+	if !annotation.HasNodeOwner(lease, node) || !currentKubeletLease(lease.Spec, nodeName, time.Now()) {
+		return fmt.Errorf("no current kubelet heartbeat for node %s", nodeName)
+	}
+
+	return nil
+}
+
+func currentKubeletLease(spec coordinationv1.LeaseSpec, nodeName string, now time.Time) bool {
+	if spec.HolderIdentity == nil || *spec.HolderIdentity != nodeName ||
+		spec.RenewTime == nil || spec.LeaseDurationSeconds == nil {
+		return false
+	}
+
+	duration := time.Duration(*spec.LeaseDurationSeconds) * time.Second
+
+	return duration > 0 && now.Before(spec.RenewTime.Add(duration))
+}
+
+func (i *Informers) filterDrainScope(ctx context.Context, pods []*v1.Pod,
+	partialDrainEntity *protos.Entity, nodeName string) ([]*v1.Pod, error) {
+	var err error
+
 	pods = i.filterEvictablePods(pods, partialDrainEntity)
 
 	if i.drainGPUPods && partialDrainEntity == nil {
@@ -626,10 +744,12 @@ func (i *Informers) filterEvictablePods(pods []*v1.Pod, partialDrainEntity *prot
 			continue
 		}
 
-		// Only skip draining for pods stuck terminating or not ready if we are executing a full drain.
+		// Legacy full drains skip pods stuck terminating or not ready. Strict drains
+		// keep them until termination is observed, including AllowCompletion pods.
 		// There is no guarantee that a pod in either state does not still have a GPU device handle that
 		// would cause a GPU reset to fail.
-		if partialDrainEntity == nil && (i.isPodStuckInTerminating(pod) || i.isPodNotReady(pod)) {
+		if !i.requirePodTermination && partialDrainEntity == nil &&
+			(i.isPodStuckInTerminating(pod) || i.isPodNotReady(pod)) {
 			slog.Info("Ignoring pod in namespace on node",
 				"pod", pod.Name,
 				"namespace", pod.Namespace,
@@ -686,17 +806,21 @@ func (i *Informers) isDaemonSetPod(pod *v1.Pod) bool {
 	return false
 }
 
+func podTerminationGracePeriod(pod *v1.Pod) time.Duration {
+	if pod.Spec.TerminationGracePeriodSeconds != nil {
+		return time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * time.Second
+	}
+
+	return 30 * time.Second
+}
+
 func (i *Informers) isPodStuckInTerminating(pod *v1.Pod) bool {
 	if pod.DeletionTimestamp == nil {
 		return false
 	}
 
-	gracePeriod := 30
-	if pod.Spec.TerminationGracePeriodSeconds != nil {
-		gracePeriod = int(*pod.Spec.TerminationGracePeriodSeconds)
-	}
-
-	timeoutThreshold := pod.DeletionTimestamp.Add(time.Duration(gracePeriod) * time.Second)
+	gracePeriod := podTerminationGracePeriod(pod)
+	timeoutThreshold := pod.DeletionTimestamp.Add(gracePeriod)
 
 	// If current time is beyond the timeout threshold, pod is considered stuck
 	if time.Now().After(timeoutThreshold) {
@@ -704,7 +828,7 @@ func (i *Informers) isPodStuckInTerminating(pod *v1.Pod) bool {
 			"pod", pod.Name,
 			"namespace", pod.Namespace,
 			"deletionTimestamp", pod.DeletionTimestamp,
-			"gracePeriod", gracePeriod,
+			"gracePeriod", gracePeriod.Seconds(),
 			"timeoutThreshold", timeoutThreshold)
 
 		return true
@@ -829,6 +953,11 @@ func (i *Informers) sendEvictionRequestForPod(ctx context.Context, namespace str
 			DryRun:             i.dryRunMode,
 			Preconditions:      podDeletionPreconditions(pod),
 		},
+	}
+
+	if i.requirePodTermination {
+		// Let the API server use the pod's terminationGracePeriodSeconds.
+		eviction.DeleteOptions.GracePeriodSeconds = nil
 	}
 
 	err := i.clientset.PolicyV1().Evictions(pod.Namespace).Evict(ctx, eviction)
@@ -1199,17 +1328,19 @@ func (i *Informers) CheckIfObservedPodsAreEvictedInImmediateMode(ctx context.Con
 		return true
 	}
 
+	if i.requirePodTermination {
+		slog.InfoContext(ctx, "Waiting for pod termination before completing drain", "node", nodeName,
+			"remainingPods", len(remainingPods))
+
+		return false
+	}
+
 	now := time.Now()
 	shouldForceDelete := false
 
 	for _, pod := range remainingPods {
 		if pod.DeletionTimestamp != nil {
-			gracePeriod := 30 * time.Second
-			if pod.Spec.TerminationGracePeriodSeconds != nil {
-				gracePeriod = time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * time.Second
-			}
-
-			deletionDeadline := pod.DeletionTimestamp.Add(gracePeriod).Add(timeout)
+			deletionDeadline := pod.DeletionTimestamp.Add(podTerminationGracePeriod(pod)).Add(timeout)
 			if now.After(deletionDeadline) {
 				shouldForceDelete = true
 				break

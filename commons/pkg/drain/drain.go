@@ -76,7 +76,7 @@ func IsNodeDrained(ctx context.Context, healthEventStore datastore.HealthEventSt
 
 func didDrainCompleteForEvent(ctx context.Context, healthEventStore datastore.HealthEventStore, nodeName,
 	eventID string, currentPartialEntity *protos.Entity, partialDrainEnabled bool) (bool, error) {
-	status, healthEvent, err := getHealthEventFromId(ctx, healthEventStore, nodeName, eventID)
+	status, healthEvent, err := GetHealthEventByID(ctx, healthEventStore, nodeName, eventID)
 	if err != nil {
 		return false, fmt.Errorf("looking up health event %s for node %s: %w", eventID, nodeName, err)
 	}
@@ -95,7 +95,8 @@ func didDrainCompleteForEvent(ctx context.Context, healthEventStore datastore.He
 	return doesDrainCoverPartialEntity(ctx, drainCompletedForEvent, entity, currentPartialEntity, eventID, nodeName), nil
 }
 
-func getHealthEventFromId(ctx context.Context, healthEventStore datastore.HealthEventStore, nodeName,
+// GetHealthEventByID resolves a stored event and its drain status across datastore backends.
+func GetHealthEventByID(ctx context.Context, healthEventStore datastore.HealthEventStore, nodeName,
 	id string) (*datastore.HealthEventWithStatus, *protos.HealthEvent, error) {
 	q := query.New().Build(query.Eq("_id", id))
 

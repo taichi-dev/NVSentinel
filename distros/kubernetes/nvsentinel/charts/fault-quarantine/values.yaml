@@ -49,6 +49,11 @@ clientCertMountPath: /etc/ssl/client-certs
 # These labels track the quarantine/uncordon lifecycle and help with debugging and auditing
 labelPrefix: "k8saas.nvidia.com/"
 
+# Keep a matched CONTACT_SUPPORT quarantine until an operator clears it.
+holdContactSupport: false
+# Wait for the external GPU rebooter to validate the current boot before releasing quarantine.
+requireExternalRebootReceipt: false
+
 # Circuit breaker configuration to prevent cascading failures
 # The circuit breaker prevents quarantining too many GPU nodes in the cluster at once
 # If the percentage threshold is exceeded, the circuit breaker trips and new quarantine actions are blocked
@@ -59,6 +64,8 @@ labelPrefix: "k8saas.nvidia.com/"
 gpuNodeLabel: "nvidia.com/gpu.present=true"
 
 circuitBreaker:
+  # Continue processing recoveries at the limit. New quarantines are suppressed while tripped.
+  allowRecovery: false
   # Enable/disable circuit breaker protection (passed as command-line arg to the deployment)
   enabled: true
   # Maximum percentage of GPU nodes (identified by gpuNodeLabel) that can be quarantined
@@ -286,6 +293,8 @@ ruleSets:
 # occurred during the quarantine session and these tests are derived from the ruleSets
 # section below.
 validation:
+  # Wait for the generic provider's completed RebootNode in the restart group and validate its new boot.
+  requireCompletedReboot: false
   enabled: false
   # Whether node-drainer drains COMPONENT_RESET events partially. Must match
   # node-drainer.partialDrainEnabled. While true, a COMPONENT_RESET event's drain never counts as a

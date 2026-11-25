@@ -26,12 +26,17 @@ import (
 
 type mockHealthEventStore struct {
 	datastore.HealthEventStore
-	findHealthEventsByQueryFn func(ctx context.Context, builder datastore.QueryBuilder) ([]datastore.HealthEventWithStatus, error)
+	findLatestHealthEventByQueryFn func(context.Context, datastore.QueryBuilder) (*datastore.HealthEventWithStatus, error)
+	findHealthEventsByQueryFn      func(ctx context.Context, builder datastore.QueryBuilder) ([]datastore.HealthEventWithStatus, error)
 }
 
 func (m *mockHealthEventStore) FindHealthEventsByQuery(ctx context.Context,
 	builder datastore.QueryBuilder) ([]datastore.HealthEventWithStatus, error) {
 	return m.findHealthEventsByQueryFn(ctx, builder)
+}
+
+func (m *mockHealthEventStore) FindLatestHealthEventByQuery(ctx context.Context, q datastore.QueryBuilder) (*datastore.HealthEventWithStatus, error) {
+	return m.findLatestHealthEventByQueryFn(ctx, q)
 }
 
 func mockHealthEventStoreWithDrainStatus(t *testing.T, drained bool) *mockHealthEventStore {

@@ -17,6 +17,7 @@ package informer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -232,6 +233,33 @@ func TestQuarantineNodeAndSetAnnotations_QPSControlledCordonThroughput_HigherQPS
 	assert.LessOrEqual(t, throughputRatio, 14.0)
 }
 
+func TestLiveQuarantineRemovesDryRunMarkerMissingFromCache(t *testing.T) {
+	ctx := t.Context()
+	nodes := testClient.CoreV1().Nodes()
+	name := testutils.GenerateTestNodeName("stale-dry-run")
+	createTestNode(ctx, t, name, nil, nil, nil, true)
+	t.Cleanup(func() { _ = nodes.Delete(context.Background(), name, metav1.DeleteOptions{}) })
+
+	cached, err := nodes.Get(ctx, name, metav1.GetOptions{})
+	require.NoError(t, err)
+	client := &FaultQuarantineClient{Clientset: testClient, NodeInformer: cachedNodeInformer(t, cached)}
+	live := cached.DeepCopy()
+	live.Annotations = map[string]string{common.QuarantineHealthEventDryRunAnnotationKey: "true", "keep": "yes"}
+	_, err = nodes.Update(ctx, live, metav1.UpdateOptions{})
+	require.NoError(t, err)
+
+	const sessionRecord = `[{"checkName":"GpuXidError"}]`
+	session := map[string]string{common.QuarantineHealthEventAnnotationKey: sessionRecord}
+	_, err = client.QuarantineNodeAndSetAnnotations(ctx, name, nil, true, session, nil)
+	require.NoError(t, err)
+	got, err := nodes.Get(ctx, name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, got.Annotations, common.QuarantineHealthEventDryRunAnnotationKey)
+	assert.Equal(t, sessionRecord, got.Annotations[common.QuarantineHealthEventAnnotationKey])
+	assert.Equal(t, "yes", got.Annotations["keep"])
+	assert.True(t, got.Spec.Unschedulable)
+}
+
 func TestQuarantineNodeAndSetAnnotations(t *testing.T) {
 	ctx := context.Background()
 	nodeName := testutils.GenerateTestNodeName("test-taint-cordon")
@@ -360,6 +388,36 @@ func TestQuarantineNodeAndSetAnnotationsMergesAppliedLabelWinners(t *testing.T) 
 		{Key: "gpu-fault", Value: "critical", Priority: 10, Order: 0},
 		{Key: "network-fault", Value: "active", Priority: 5, Order: 1},
 	}, applied)
+}
+
+func TestGuardedMetadataPatchRechecksConcurrentRelease(t *testing.T) {
+	ctx := t.Context()
+	node := &v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "guarded-refault"}, Spec: v1.NodeSpec{Unschedulable: true}}
+	nodes := testClient.CoreV1().Nodes()
+	_, err := nodes.Create(ctx, node, metav1.CreateOptions{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = nodes.Delete(context.Background(), node.Name, metav1.DeleteOptions{}) })
+	c := &FaultQuarantineClient{Clientset: testClient}
+	released := errors.New("cordon released")
+	ctx = WithNodeGuard(ctx, func(live *v1.Node) error {
+		if !live.Spec.Unschedulable {
+			return released
+		}
+		return nil
+	})
+	err = c.UpdateNode(ctx, node.Name, func(current *v1.Node) error {
+		live, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
+		require.NoError(t, err)
+		live.Spec.Unschedulable = false
+		_, err = nodes.Update(ctx, live, metav1.UpdateOptions{})
+		require.NoError(t, err)
+		current.Annotations = map[string]string{"new-fault": "true"}
+		return nil
+	})
+	require.ErrorIs(t, err, released)
+	live, err := nodes.Get(ctx, node.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	require.Empty(t, live.Annotations["new-fault"])
 }
 
 func TestUnQuarantineNodeAndRemoveAnnotations(t *testing.T) {

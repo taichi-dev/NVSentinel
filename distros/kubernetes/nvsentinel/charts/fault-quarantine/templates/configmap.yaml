@@ -21,6 +21,8 @@ metadata:
     argocd.argoproj.io/sync-wave: "-1"
 data:
   config.toml: |
+    requireExternalRebootReceipt = {{ .Values.requireExternalRebootReceipt | default false }}
+    holdContactSupport = {{ .Values.holdContactSupport | default false }}
     label-prefix = {{ .Values.labelPrefix | quote }}
     {{- if include "fault-quarantine.gpuRecheckEnabled" . }}
     {{- if ne (int .Values.replicaCount) 1 }}
@@ -34,6 +36,7 @@ data:
     {{- end }}
     
     [circuitBreaker]
+    allowRecovery = {{ .Values.circuitBreaker.allowRecovery | default false }}
     percentage = {{ .Values.circuitBreaker.percentage }}
     maxNodes = {{ .Values.circuitBreaker.maxNodes | default 0 }}
     maxCordonedNodes = {{ .Values.circuitBreaker.maxCordonedNodes | default 0 }}
@@ -84,8 +87,9 @@ data:
         shouldCordon = {{ .cordon.shouldCordon }}
     {{- end }}
 
-    {{- if .Values.validation.enabled }}
+    {{- if or .Values.validation.enabled .Values.requireExternalRebootReceipt }}
     [validation]
+      requireCompletedReboot = {{ .Values.validation.requireCompletedReboot | default false }}
       enabled = {{ .Values.validation.enabled }}
       apiGroup = {{ .Values.validation.apiGroup | quote }}
       version = {{ .Values.validation.version | quote }}
